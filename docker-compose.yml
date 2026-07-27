@@ -1,0 +1,88 @@
+# Запуск ассистента в контейнерах.
+#
+#   docker compose up -d              — поднять админку и бота
+#   docker compose --profile gpu up   — плюс локальную модель на видеокарте
+#   docker compose exec app python index.py build   — проиндексировать базу
+#
+# Папка базы знаний подключается только на чтение: ассистент никогда
+# не изменяет исходные документы.
+
+services:
+  app:
+    build: .
+    image: kb-assistant:latest
+    container_name: kb-admin
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      DATA_DIR: /data
+      LOG_DIR: /data/logs
+      KB_ROOT: /kb
+      ADMIN_HOST: 0.0.0.0
+    volumes:
+      - ${KB_ROOT:-./kb}:/kb:ro
+      - kb-data:/data
+    ports:
+      - "127.0.0.1:8800:8800"
+    command: python webui.py
+
+  bot:
+    image: kb-assistant:latest
+    container_name: kb-bot
+    restart: unless-stopped
+    depends_on: [app]
+    env_file: [.env]
+    environment:
+      DATA_DIR: /data
+      LOG_DIR: /data/logs
+      KB_ROOT: /kb
+    volumes:
+      - ${KB_ROOT:-./kb}:/kb:ro
+      - kb-data:/data
+    command: python bot.py
+
+  watcher:
+    image: kb-assistant:latest
+    container_name: kb-watcher
+    restart: unless-stopped
+    depends_on: [app]
+    env_file: [.env]
+    environment:
+      DATA_DIR: /data
+      LOG_DIR: /data/logs
+      KB_ROOT: /kb
+    volumes:
+      - ${KB_ROOT:-./kb}:/kb:ro
+      - kb-data:/data
+    command: python watcher.py run
+
+  # Локальная модель на видеокартах. Включается профилем: --profile gpu
+  model:
+    image: vllm/vllm-openai:latest
+    container_name: kb-model
+    profiles: [gpu]
+    restart: unless-stopped
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HF_ENDPOINT: ${HF_MIRROR:-https://huggingface.co}
+    volumes:
+      - kb-models:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: >
+      --model ${LOCAL_MODEL_REPO:-t-tech/T-pro-it-2.0}
+      --served-model-name ${LOCAL_MODEL_ID:-t-pro-2.0}
+      --tensor-parallel-size ${GPU_COUNT:-2}
+      --gpu-memory-utilization ${LOCAL_MODEL_GPU_FRACTION:-0.90}
+      --max-model-len ${LOCAL_MODEL_CONTEXT:-32768}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  kb-data:
+  kb-models:

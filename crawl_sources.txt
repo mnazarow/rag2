@@ -1,0 +1,3 @@
+# По одному адресу в строке. Строки с # игнорируются.
+# https://wilo.ru/
+# https://imp-pump.ru/documents/
