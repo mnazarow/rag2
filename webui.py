@@ -641,6 +641,8 @@ pre{background:#0c0e13;border:1px solid #232833;border-radius:8px;padding:11px;o
   background:#22304a;color:#8fb0dd;vertical-align:middle}
 .setting .mark.def{background:#20242c;color:#6f7889}
 .setting .mark.key{background:#3a2a20;color:#d9a06a}
+.setting .mark.ok{background:#1e3326;color:#7fc48f}
+.setting .mark.warn{background:#3a3220;color:#d9c46a}
 .setting .side{display:flex;flex-direction:column;gap:5px;min-width:230px}
 .setting .side .tiny{font-size:11px;color:#6f7889}
 .setting .side button{font-size:11px;padding:3px 8px}
@@ -663,7 +665,8 @@ svg{display:block;width:100%}
 </style></head><body>
 <header><h1>Ассистент базы знаний</h1>
 <nav>
- <button data-t="overview" class="on">Обзор</button>
+ <button data-t="quick" class="on">Быстрый старт</button>
+ <button data-t="overview">Обзор</button>
  <button data-t="flow">Конвейер</button>
  <button data-t="models">Модели</button>
  <button data-t="kb">База знаний</button>
@@ -682,7 +685,7 @@ svg{display:block;width:100%}
 </nav><div id="health"></div></header>
 <main>
 
-<section id="overview" class="on">
+<section id="overview">
   <h2>Состояние системы</h2>
   <div class="cards" id="ovCards"></div>
   <div class="grid2" style="margin-top:16px">
@@ -719,6 +722,17 @@ svg{display:block;width:100%}
   <h2>Последние события</h2>
   <table id="events"><thead><tr><th>Время</th><th>Этап</th><th>Статус</th>
     <th>Подробности</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section id="quick" class="on">
+  <h2>Быстрый старт</h2>
+  <p class="muted">Те же шаги, что напечатал установщик, — но видно, какие из
+    них уже сделаны. Это и есть главное: третий и четвёртый шаги внешне
+    неразличимы, обе команды отрабатывают без ошибок, а поиск при
+    пропущенном третьем находит только точные слова из документа.
+    Обнаруживается это обычно через неделю, по жалобе сотрудника.</p>
+  <div class="panel" id="qsSummary">Загружаю…</div>
+  <div id="qsSteps"></div>
 </section>
 
 <section id="models">
@@ -1333,6 +1347,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('on'));
   document.querySelectorAll('section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $(b.dataset.t).classList.add('on');
+  if (b.dataset.t === 'quick') loadQuick();
   if (b.dataset.t === 'models') { loadModels(); loadLlm(); }
   if (b.dataset.t === 'diag') loadDiag();
   if (b.dataset.t === 'voice') loadVoices();
@@ -1842,6 +1857,107 @@ async function checkSip(){
   $('sipOut').textContent=r.text;
 }
 
+/* --------------------------------- быстрый старт -------------------------- */
+let QUICK = null;
+async function loadQuick(){
+  QUICK = await (await fetch('/api/quickstart')).json();
+  const pct = QUICK.total ? Math.round(QUICK.done / QUICK.total * 100) : 0;
+  const left = QUICK.total - QUICK.done;
+  $('qsSummary').innerHTML =
+    `<div><b>Сделано ${QUICK.done} из ${QUICK.total}</b>
+       ${left ? `· осталось ${left}` : '· всё готово'}</div>
+     <div class="bar" style="margin-top:8px"><i style="width:${pct}%"></i></div>
+     <div class="muted" style="margin-top:8px">Команды для терминала показаны у
+       каждого шага: интерфейс и инструкция установщика делают одно и то же.
+       Интерпретатор этой установки: <code>${esc(QUICK.python)}</code></div>`;
+  renderQuickSteps();
+}
+function renderQuickSteps(){
+  $('qsSteps').innerHTML = (QUICK.steps || []).map(step => {
+    const isNext = step.key === QUICK.next;
+    const mark = step.skip
+      ? '<span class="mark def">не требуется</span>'
+      : (step.done === true ? '<span class="mark ok">сделано</span>'
+        : step.done === null ? '<span class="mark">проверка</span>'
+        : '<span class="mark warn">не сделано</span>');
+    // Настройки шага — те же карточки, что в разделе «Настройки»:
+    // описание, рекомендация и пример живут в одном месте и не расходятся.
+    const ids = [];
+    const fields = (SETTINGS.length ? (step.settings || []) : []).map(key => {
+      const idx = SETTINGS.findIndex(x => x.key === key);
+      if (idx < 0) return '';
+      ids.push(idx);
+      return settingCard(SETTINGS[idx], 'qs_' + idx);
+    }).join('');
+    const buttons = [];
+    if (step.action && step.action.kind)
+      buttons.push(`<button class="act" onclick="runQuick('${step.key}')">
+        ${esc(step.action_label || 'Выполнить')}</button>`);
+    if (step.action && step.action.goto)
+      buttons.push(`<button class="act sec"
+        onclick="document.querySelector('nav button[data-t=${step.action.goto}]').click()">
+        ${esc(step.action_label || 'Открыть')}</button>`);
+    if (step.extra)
+      buttons.push(`<button class="act sec" onclick="quickExtra('${step.key}')">
+        ${esc(step.extra.label)}</button>`);
+    if (fields)
+      buttons.push(`<button class="act sec" onclick="saveQuick(${step.number})">
+        Сохранить настройки шага</button>`);
+    return `<div class="setting${isNext ? ' changed' : ''}" id="qs_step_${step.key}">
+      <div class="row"><div class="lbl">
+        <h4>${step.number}. ${esc(step.title)} ${mark}</h4>
+        <p>${esc(step.detail || '')}</p>
+        ${step.hint ? `<p class="rec">${esc(step.hint)}</p>` : ''}
+        ${(step.warnings || []).map(w =>
+            `<p class="rec">! ${esc(w)}</p>`).join('')}
+        ${step.command ? `<p class="ex">${esc(quickCommand(step.command))}</p>` : ''}
+      </div></div>
+      ${fields ? `<div style="margin-top:10px" data-idx="${ids.join(',')}"
+                       id="qs_fields_${step.number}">${fields}</div>` : ''}
+      ${buttons.length ? `<div class="toolbar" style="margin-top:8px">
+         ${buttons.join('')}<span class="good" id="qs_saved_${step.number}"></span>
+       </div>` : ''}
+    </div>`;
+  }).join('');
+}
+// Путь к интерпретатору подставляем только там, где команда его требует.
+// Иначе получается «/usr/bin/python3 nano .env», и человек это копирует.
+function quickCommand(cmd){
+  return cmd.split(' && ')
+            .map(part => part.startsWith('python ')
+                 ? QUICK.python + part.slice(6) : part)
+            .join(' && ');
+}
+async function runQuick(key){
+  const r = await (await fetch('/api/quickstart/run', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({step:key})})).json();
+  alert(r.message || r.error || 'Готово');
+  document.querySelector('nav button[data-t=flow]').click();
+}
+async function quickExtra(key){
+  const step = QUICK.steps.find(x => x.key === key);
+  if (!step || !step.extra) return;
+  const r = await (await fetch(step.extra.post, {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(step.extra.body || {})})).json();
+  alert(r.message || r.error || 'Готово');
+  loadQuick();
+}
+async function saveQuick(number){
+  const box = $('qs_fields_' + number);
+  if (!box) return;
+  const payload = {};
+  (box.dataset.idx || '').split(',').filter(Boolean).forEach(i => {
+    const setting = SETTINGS[+i], el = $('qs_' + i);
+    if (!el) return;
+    if (setting.type === 'secret' && !el.value) return;
+    payload[setting.key] = setting.type === 'bool' ? (el.checked ? '1' : '0') : el.value;
+  });
+  if (await submitSettings(payload, 'qs_saved_' + number)) { await loadSettings(); loadQuick(); }
+}
+setInterval(() => { if ($('quick').classList.contains('on')) loadQuick(); }, 20000);
+
 /* ----------------------------------- настройки ---------------------------- */
 let SETTINGS=[], SETGROUPS=[], SETMETA={};
 async function loadSettings(){
@@ -2054,7 +2170,9 @@ function scheduleCheck(){
       ? `<div class="panel">${issuesHtml(r.issues)}</div>` : '';
   },500);
 }
-loadSettings();
+// Быстрый старт открыт по умолчанию, а карточки настроек в нём — те же,
+// что в разделе «Настройки». Поэтому сначала настройки, потом шаги.
+loadSettings().then(loadQuick);
 
 /* ------------------------------- безопасность ----------------------------- */
 async function loadSafety(){
@@ -2912,6 +3030,10 @@ class Handler(BaseHTTPRequestHandler):
                 if (account or {}).get("role") == "admin"
                 or not security.accounts_enabled() else {},
             })
+        if path == "/api/quickstart":
+            import quickstart
+            return self._json(quickstart.state())
+
         if path == "/api/schedule":
             import schedule as schedule_mod
             return self._json(schedule_mod.status())
@@ -3349,6 +3471,45 @@ class Handler(BaseHTTPRequestHandler):
             result = security.move_secrets_from_env()
             audit("ключи", result["message"])
             return self._json(result)
+
+        if path == "/api/quickstart/run":
+            # Шаг быстрого старта выполняется тем же способом, что и всё
+            # остальное: через очередь заданий. Отдельного пути тут нет
+            # намеренно — иначе действие из «Быстрого старта» обошло бы
+            # блокировки и могло запуститься параллельно с тем же самым,
+            # запущенным из своего раздела.
+            import jobs
+            import quickstart
+            key = str(payload.get("step") or "")
+            step = next((fn() for k, _t, fn in quickstart.STEPS if k == key), None)
+            action = (step or {}).get("action") or {}
+            kind = action.get("kind")
+            if not kind:
+                return self._json({"error": "у этого шага нет действия"}, 400)
+            try:
+                job = jobs.enqueue(kind, action.get("title") or kind,
+                                   {"reason": "быстрый старт"},
+                                   created_by=self._who())
+            except jobs.Busy as exc:
+                return self._json({"message": str(exc)}, 409)
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"message": safe_error(exc)}, 400)
+            jobs.start_worker()
+            audit("быстрый старт", f"{key}: {kind}")
+            message = f"«{action.get('title') or kind}» поставлено в очередь (№{job['id']})."
+            # У шага может быть продолжение: обучить модель и следом
+            # пересчитать векторы. Ставим сразу оба — по отдельности их
+            # запускать бессмысленно, а забыть второй легко.
+            if action.get("then"):
+                try:
+                    second = jobs.enqueue(action["then"], action["then"],
+                                          {"reason": "быстрый старт"},
+                                          created_by=self._who())
+                    message += (f" Следом выполнится «{action['then']}» "
+                                f"(№{second['id']}).")
+                except Exception as exc:  # noqa: BLE001
+                    message += f" Второй шаг поставить не вышло: {exc}"
+            return self._json({"ok": True, "job": job["id"], "message": message})
 
         if path == "/api/schedule":
             import schedule as schedule_mod

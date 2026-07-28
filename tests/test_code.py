@@ -276,3 +276,70 @@ class TestSecretsNeverLeak(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuickStart(unittest.TestCase):
+    """
+    Быстрый старт повторяет то, что печатает установщик. Если списки
+    разойдутся, человек, начавший по бумажке, увидит в интерфейсе другое —
+    а это ровно тот случай, когда перестают доверять обоим.
+    """
+
+    def test_every_step_has_command_and_explanation(self):
+        import quickstart
+        bad = []
+        for key, title, fn in quickstart.STEPS:
+            step = fn()
+            if not title:
+                bad.append(f"{key}: нет заголовка")
+            if not step.get("command"):
+                bad.append(f"{key}: нет команды для терминала")
+            if step.get("detail") is None:
+                bad.append(f"{key}: нечего показать о состоянии")
+        self.assertFalse(bad, "\n".join(bad))
+
+    def test_settings_of_steps_exist_in_the_panel(self):
+        import quickstart
+        import settings_schema
+        known = {s["key"] for s in settings_schema.SETTINGS}
+        missing = []
+        for key, _title, fn in quickstart.STEPS:
+            for name in fn().get("settings", []):
+                if name not in known:
+                    missing.append(f"{key} → {name}")
+        self.assertFalse(missing,
+                         "шаг ссылается на настройку, которой нет в панели: "
+                         + ", ".join(missing))
+
+    def test_actions_are_real_job_kinds(self):
+        """Кнопка должна ставить задачу, которая существует."""
+        import handlers  # noqa: F401 — регистрация обработчиков
+        import jobs
+        import quickstart
+        bad = []
+        for key, _title, fn in quickstart.STEPS:
+            action = fn().get("action") or {}
+            for field in ("kind", "then"):
+                kind = action.get(field)
+                if kind and kind not in jobs.HANDLERS:
+                    bad.append(f"{key}.{field} → {kind}")
+        self.assertFalse(bad, "нет такого вида задачи: " + ", ".join(bad))
+
+    def test_installer_and_panel_agree(self):
+        """
+        Каждая команда из вывода установщика должна встречаться в шагах, и
+        наоборот. Именно эта пара и расходится со временем.
+        """
+        import re
+
+        import quickstart
+        script = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+        printed = set(re.findall(r"\$TARGET/([a-z_]+\.py)", script))
+        printed -= {"webui.py"}          # запускается службой, в шагах отдельно
+        in_steps = set()
+        for _key, _title, fn in quickstart.STEPS:
+            in_steps.update(re.findall(r"([a-z_]+\.py)", fn().get("command", "")))
+        forgotten = printed - in_steps
+        self.assertFalse(forgotten,
+                         "установщик советует, а в быстром старте нет: "
+                         + ", ".join(sorted(forgotten)))
