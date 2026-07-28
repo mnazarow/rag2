@@ -231,6 +231,12 @@ print(f'  очередь к модели: не больше {config.LLM_MAX_CONC
 fi
 if [ "$WITH_SERVICE" = 1 ]; then
   if [ "$PLATFORM" = linux ] && command -v systemctl >/dev/null 2>&1; then
+    # Имя пользователя берём надёжным способом. Переменная USER в
+    # неинтерактивной оболочке — при установке по SSH одной командой, из
+    # cron или из скрипта — может быть не задана вовсе, и при set -u
+    # установка падала на «USER: unbound variable» ровно в тот момент,
+    # когда всё остальное уже сделано.
+    RUN_AS="${SUDO_USER:-${USER:-$(id -un)}}"
     UNIT=/etc/systemd/system/$APP_NAME.service
     say "Создаю службу systemd (нужны права root)"
     run "sudo tee $UNIT >/dev/null <<UNITEOF
@@ -240,7 +246,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=$USER
+User=$RUN_AS
 WorkingDirectory=$TARGET
 ExecStart=$VENV_PY $TARGET/webui.py
 Restart=on-failure
