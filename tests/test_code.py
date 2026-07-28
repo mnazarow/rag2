@@ -343,3 +343,41 @@ class TestQuickStart(unittest.TestCase):
         self.assertFalse(forgotten,
                          "установщик советует, а в быстром старте нет: "
                          + ", ".join(sorted(forgotten)))
+
+    def test_every_checked_tool_can_be_installed(self):
+        """
+        Установщик сам ставит недостающие утилиты. Добавить утилиту в
+        список проверки и забыть имя пакета для одного из менеджеров —
+        ошибка бесшумная: на этом дистрибутиве утилита просто не встанет,
+        а скрипт скажет «часть пакетов не установилась» и пойдёт дальше.
+        """
+        import re
+
+        script = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+        m = re.search(r"for tool in ([a-z ]+); do", script)
+        self.assertTrue(m, "не нашёл список проверяемых утилит")
+        tools = m.group(1).split()
+
+        bad = []
+        for tool in tools:
+            if f"TOOL_WHY_{tool}=" not in script:
+                bad.append(f"{tool}: нет объяснения TOOL_WHY_{tool}")
+            for mgr in ("apt", "dnf", "pacman", "zypper", "brew"):
+                if not re.search(rf"^\s*{mgr}:{tool}\)", script, re.M):
+                    bad.append(f"{tool}: нет имени пакета для {mgr}")
+        self.assertFalse(bad, "; ".join(bad))
+
+    def test_package_install_can_be_switched_off(self):
+        """
+        На сервере, где пакеты ставит конфигурация, самодеятельность
+        установщика вредна — ключ отказа должен быть и в обоих скриптах,
+        и в документации.
+        """
+        sh = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
+        ps = (ROOT / "install" / "install.ps1").read_text(encoding="utf-8")
+        doc = (ROOT / "ДОКУМЕНТАЦИЯ.md").read_text(encoding="utf-8")
+        self.assertIn("--no-packages", sh)
+        self.assertIn("WITH_PACKAGES=0", sh)
+        self.assertIn("NoPackages", ps)
+        self.assertIn("--no-packages", doc)
+        self.assertIn("-NoPackages", doc)

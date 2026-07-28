@@ -6,6 +6,7 @@
 #   ./install.sh --with-gpu          — плюс библиотеки для локальных моделей
 #   ./install.sh --dir /opt/kb       — куда ставить
 #   ./install.sh --service           — зарегистрировать автозапуск
+#   ./install.sh --no-packages       — не ставить системные пакеты самому
 #   ./install.sh --dry-run           — показать, что будет сделано
 #
 # Скрипт идемпотентен: повторный запуск ничего не ломает и лишнего не ставит.
@@ -18,6 +19,11 @@ WITH_DOCKER=0
 WITH_GPU=0
 WITH_SERVICE=0
 DRY_RUN=0
+# Ставить недостающие системные пакеты самим. Включено: строчку «а теперь
+# выполните вот эту команду» пропускают, и потом неделю выясняют, почему
+# не распознаются сканы. Выключается там, где пакетами ведает
+# конфигурация сервера.
+WITH_PACKAGES=1
 PYTHON_MIN="3.10"
 
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; NC='\033[0m'
@@ -56,6 +62,7 @@ while [ $# -gt 0 ]; do
     --docker) WITH_DOCKER=1 ;;
     --with-gpu) WITH_GPU=1 ;;
     --service) WITH_SERVICE=1 ;;
+    --no-packages) WITH_PACKAGES=0 ;;
     --dry-run) DRY_RUN=1 ;;
     --dir) shift; TARGET="${1:?после --dir нужен путь}" ;;
     -h|--help) usage ;;
@@ -146,30 +153,147 @@ fi
 ok "$PY $($PY -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])')"
 
 # ------------------------------------------------------- системные утилиты --
-step "Проверяю системные утилиты"
+# Ставим сами. Раньше скрипт печатал команду и предлагал выполнить её
+# руками — и это ровно та строчка, которую пропускают: установка ведь
+# «прошла успешно». Потом выясняется, что видео не расшифровывается,
+# сканы не распознаются, а архивы с сертификатами не распакованы, и
+# связать это с пропущенной строкой в начале уже трудно.
+#
+# Правила здесь такие. Ставим только то, чего нет. Ошибка установки
+# пакета не прерывает работу: без ffmpeg система ущербна, но работает, а
+# упавшая на середине установка не работает вовсе. И всё это можно
+# выключить ключом --no-packages: на сервере, где пакеты ставит
+# конфигурация, самодеятельность вредна.
+step "Системные утилиты"
+
+# Что за что отвечает — чтобы предупреждение говорило о последствиях,
+# а не об имени пакета.
+TOOL_WHY_ffmpeg="видео и голосовые сообщения"
+TOOL_WHY_pdftotext="разбор PDF, если не встанет PyMuPDF"
+TOOL_WHY_bsdtar="распаковка архивов RAR с сертификатами"
+TOOL_WHY_git="обновления"
+TOOL_WHY_tesseract="распознавание сканов сертификатов"
+
 MISSING=""
-check_tool() {
-  if command -v "$1" >/dev/null 2>&1; then ok "$1 — есть"
-  else warn "$1 — нет ($2)"; MISSING="$MISSING $1"; fi
+for tool in ffmpeg pdftotext bsdtar git tesseract; do
+  if command -v "$tool" >/dev/null 2>&1; then ok "$tool — есть"
+  else
+    eval "why=\${TOOL_WHY_$tool}"
+    warn "$tool — нет ($why)"
+    MISSING="$MISSING $tool"
+  fi
+done
+
+# Пакеты, в которых лежат эти утилиты. Имена у каждого менеджера свои.
+packages_for() {
+  local mgr="$1" out=""
+  for tool in $MISSING; do
+    case "$mgr:$tool" in
+      apt:ffmpeg)     out="$out ffmpeg" ;;
+      apt:pdftotext)  out="$out poppler-utils" ;;
+      apt:bsdtar)     out="$out libarchive-tools" ;;
+      apt:git)        out="$out git" ;;
+      apt:tesseract)  out="$out tesseract-ocr tesseract-ocr-rus" ;;
+      dnf:ffmpeg)     out="$out ffmpeg-free" ;;
+      dnf:pdftotext)  out="$out poppler-utils" ;;
+      dnf:bsdtar)     out="$out bsdtar" ;;
+      dnf:git)        out="$out git" ;;
+      dnf:tesseract)  out="$out tesseract tesseract-langpack-rus" ;;
+      pacman:ffmpeg)    out="$out ffmpeg" ;;
+      pacman:pdftotext) out="$out poppler" ;;
+      pacman:bsdtar)    out="$out libarchive" ;;
+      pacman:git)       out="$out git" ;;
+      pacman:tesseract) out="$out tesseract tesseract-data-rus" ;;
+      zypper:ffmpeg)    out="$out ffmpeg" ;;
+      zypper:pdftotext) out="$out poppler-tools" ;;
+      zypper:bsdtar)    out="$out libarchive" ;;
+      zypper:git)       out="$out git" ;;
+      zypper:tesseract) out="$out tesseract-ocr tesseract-ocr-traineddata-russian" ;;
+      brew:ffmpeg)      out="$out ffmpeg" ;;
+      brew:pdftotext)   out="$out poppler" ;;
+      brew:bsdtar)      out="$out libarchive" ;;
+      brew:git)         out="$out git" ;;
+      brew:tesseract)   out="$out tesseract tesseract-lang" ;;
+    esac
+  done
+  printf "%s" "$out"
 }
-check_tool ffmpeg    "видео, голосовые сообщения"
-check_tool pdftotext "разбор PDF без PyMuPDF"
-check_tool bsdtar    "распаковка архивов RAR"
-check_tool git       "обновления"
-if [ -n "$MISSING" ]; then
-  echo
-  warn "Не хватает:$MISSING"
+
+# Python-окружение на Debian и Ubuntu лежит в отдельном пакете, и без
+# него venv не создастся вовсе — а это уже не «часть возможностей».
+if [ "$PLATFORM" = linux ] && command -v apt-get >/dev/null 2>&1; then
+  if ! "$PY" -c "import venv, ensurepip" >/dev/null 2>&1; then
+    warn "python3-venv — нет (без него не создать окружение Python)"
+    MISSING="$MISSING venv"
+  fi
+fi
+
+if [ -n "$MISSING" ] && [ "$WITH_PACKAGES" = 1 ]; then
+  # Кем ставить. Под root sudo не нужен, без root и без sudo — только
+  # показать команду: молча требовать пароль в середине установки хуже,
+  # чем честно сказать, что прав не хватает.
+  SUDO=""
+  if [ "$(id -u)" != 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+  fi
+
+  MGR=""
   case "$PLATFORM" in
     linux)
-      if command -v apt-get >/dev/null 2>&1; then
-        echo "     sudo apt-get install -y ffmpeg poppler-utils libarchive-tools git \\"
-        echo "                          tesseract-ocr tesseract-ocr-rus"
-      elif command -v dnf >/dev/null 2>&1; then
-        echo "     sudo dnf install -y ffmpeg poppler-utils bsdtar git tesseract tesseract-langpack-rus"
+      if   command -v apt-get >/dev/null 2>&1; then MGR=apt
+      elif command -v dnf     >/dev/null 2>&1; then MGR=dnf
+      elif command -v pacman  >/dev/null 2>&1; then MGR=pacman
+      elif command -v zypper  >/dev/null 2>&1; then MGR=zypper
       fi ;;
-    macos) echo "     brew install ffmpeg poppler libarchive git tesseract tesseract-lang" ;;
+    macos) command -v brew >/dev/null 2>&1 && MGR=brew ;;
   esac
-  echo "     Без них часть возможностей просто не включится — установка продолжится."
+
+  PKGS="$(packages_for "$MGR")"
+  [ "$MGR" = apt ] && case " $MISSING " in *" venv "*) PKGS="$PKGS python3-venv" ;; esac
+
+  if [ -z "$MGR" ]; then
+    if [ "$PLATFORM" = macos ]; then
+      warn "Не найден Homebrew — без него пакеты не поставить."
+      echo "     Поставьте его одной командой и запустите установку снова:"
+      echo '     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    else
+      warn "Не понял, какой в системе менеджер пакетов — поставьте вручную:$MISSING"
+    fi
+  elif [ -z "$SUDO" ] && [ "$(id -u)" != 0 ] && [ "$MGR" != brew ]; then
+    warn "Нет прав на установку пакетов. Выполните и запустите снова:"
+    case "$MGR" in
+      apt)    echo "     sudo apt-get update && sudo apt-get install -y$PKGS" ;;
+      dnf)    echo "     sudo dnf install -y$PKGS" ;;
+      pacman) echo "     sudo pacman -S --needed --noconfirm$PKGS" ;;
+      zypper) echo "     sudo zypper install -y$PKGS" ;;
+    esac
+  elif [ -n "$PKGS" ]; then
+    say "Ставлю недостающие пакеты:$PKGS"
+    # Сбой не прерывает установку: часть пакетов может называться иначе
+    # или отсутствовать в репозитории, и это повод сообщить, а не падать.
+    case "$MGR" in
+      apt)    run "$SUDO apt-get update -qq" || true
+              run "$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq$PKGS" \
+                || warn "часть пакетов не установилась" ;;
+      dnf)    run "$SUDO dnf install -y -q$PKGS" || warn "часть пакетов не установилась" ;;
+      pacman) run "$SUDO pacman -S --needed --noconfirm$PKGS" \
+                || warn "часть пакетов не установилась" ;;
+      zypper) run "$SUDO zypper --non-interactive install$PKGS" \
+                || warn "часть пакетов не установилась" ;;
+      brew)   run "brew install$PKGS" || warn "часть пакетов не установилась" ;;
+    esac
+    if [ "$DRY_RUN" = 0 ]; then
+      LEFT=""
+      for tool in $MISSING; do
+        [ "$tool" = venv ] && continue
+        command -v "$tool" >/dev/null 2>&1 && ok "$tool — установлен" || LEFT="$LEFT $tool"
+      done
+      [ -n "$LEFT" ] && warn "так и не появились:$LEFT — часть возможностей не включится"
+    fi
+  fi
+elif [ -n "$MISSING" ]; then
+  warn "Не хватает:$MISSING — установка пакетов выключена ключом --no-packages"
+  echo "     Без них часть возможностей просто не включится."
 fi
 
 # ------------------------------------------------------------ размещение ----

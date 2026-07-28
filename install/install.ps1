@@ -22,6 +22,10 @@
 .PARAMETER DryRun
   Показать, что будет сделано, ничего не меняя.
 
+.PARAMETER NoPackages
+  Не ставить системные утилиты (ffmpeg, poppler, git, tesseract) через winget.
+  Список недостающих всё равно будет показан.
+
 .EXAMPLE
   .\install.ps1 -Dir D:\KB -WithGpu -Service
 #>
@@ -31,10 +35,12 @@ param(
   [switch]$Docker,
   [switch]$WithGpu,
   [switch]$Service,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [switch]$NoPackages
 )
 
 $ErrorActionPreference = "Stop"
+$WithPackages = -not $NoPackages
 $script:Step = 0
 $script:Total = if ($Docker) { 5 } else { 8 }
 
@@ -122,10 +128,50 @@ if (-not $py) {
 }
 Ok "$py $(& $py -c 'import sys;print(\"%d.%d.%d\"%sys.version_info[:3])')"
 
-Step "Проверяю утилиты"
-foreach ($t in @(@("ffmpeg","видео и голос"), @("pdftotext","разбор PDF"), @("git","обновления"))) {
-  if (Get-Command $t[0] -ErrorAction SilentlyContinue) { Ok "$($t[0]) — есть" }
-  else { Warn "$($t[0]) — нет ($($t[1])). Установить: winget install $($t[0])" }
+# Ставим сами. Строчку «а теперь выполните вот это» пропускают, а потом
+# неделю выясняют, почему не расшифровывается видео и не распознаются
+# сканы. Сбой установки пакета не прерывает работу: без утилиты система
+# ущербна, но работает, а прерванная установка не работает вовсе.
+Step "Системные утилиты"
+$tools = @(
+  @{ Cmd = "ffmpeg";    Why = "видео и голосовые сообщения"; Pkg = "Gyan.FFmpeg" },
+  @{ Cmd = "pdftotext"; Why = "разбор PDF, если не встанет PyMuPDF"; Pkg = "oschwartz10612.Poppler" },
+  @{ Cmd = "git";       Why = "обновления"; Pkg = "Git.Git" },
+  @{ Cmd = "tesseract"; Why = "распознавание сканов сертификатов"; Pkg = "UB-Mannheim.TesseractOCR" }
+)
+$missing = @()
+foreach ($t in $tools) {
+  if (Get-Command $t.Cmd -ErrorAction SilentlyContinue) { Ok "$($t.Cmd) — есть" }
+  else { Warn "$($t.Cmd) — нет ($($t.Why))"; $missing += $t }
+}
+if ($missing.Count -gt 0) {
+  if (-not $WithPackages) {
+    Warn "Установка пакетов выключена ключом -NoPackages. Без них часть возможностей не включится."
+  } elseif (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Warn "Нет winget — поставьте вручную:"
+    foreach ($t in $missing) { Write-Host "     winget install --id $($t.Pkg)" }
+  } else {
+    Say "Ставлю недостающие пакеты: $(($missing | ForEach-Object { $_.Cmd }) -join ', ')"
+    $failed = @()
+    foreach ($t in $missing) {
+      $global:LASTEXITCODE = 0
+      try {
+        Run "winget install --id $($t.Pkg) -e --accept-package-agreements --accept-source-agreements --silent"
+      } catch {
+        Warn "$($t.Cmd): $($_.Exception.Message)"
+      }
+      # winget не бросает исключений: смотрим код возврата.
+      if (-not $DryRun -and $LASTEXITCODE -ne 0) { $failed += $t.Cmd }
+      else { Ok "$($t.Cmd) — поставлен" }
+    }
+    if ($failed.Count -gt 0) {
+      Warn "Не установились: $($failed -join ', '). Поставьте вручную и запустите установку снова."
+      foreach ($t in $missing | Where-Object { $failed -contains $_.Cmd }) {
+        Write-Host "     winget install --id $($t.Pkg)"
+      }
+    }
+    Warn "Новые утилиты появятся в PATH только после перезапуска терминала."
+  }
 }
 
 Step "Размещаю файлы в $Dir"
