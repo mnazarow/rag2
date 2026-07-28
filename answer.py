@@ -120,7 +120,13 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
                        "(пользователь %s): %s", user_id, guard["matched"][:2])
 
     # 1. Выверенный экспертом ответ — если есть близкий, отдаём его.
-    golden = search_mod.golden_search(question, limit=1)
+    #
+    # Роль учитывается и здесь. Выверенный ответ пишет человек, и он
+    # запросто может содержать дилерские условия: эксперт отвечал на
+    # вопрос дилера и о разграничении не думал. Канал этот идёт первым и
+    # раньше проверок не проходил вовсе, то есть был самым коротким путём
+    # к утечке.
+    golden = search_mod.golden_search(question, limit=1, role=role)
     if golden and _golden_is_close(question, golden[0]["question"]):
         g = golden[0]
         db.run("UPDATE golden_qa SET hits=hits+1 WHERE id=?", (g["id"],))
@@ -136,7 +142,7 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
     # 2. Ценовые вопросы — в структурированную таблицу, не в векторный поиск.
     product_rows: list[dict] = []
     if prices.looks_like_price_question(question) or prices.ARTICLE_RX.search(question):
-        product_rows = prices.search_products(question, limit=8)
+        product_rows = prices.search_products(question, limit=8, role=role)
 
     # 3. Документный поиск.
     _t = time.time()
@@ -200,7 +206,8 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
     # Последняя проверка — по результату, а не по формулировке вопроса:
     # она ловит утечку из недоступного раздела независимо от того, каким
     # способом её добились.
-    leak = security.check_answer_leak(text, hits, config.ROLE_SECTIONS.get(role))
+    leak = security.check_answer_leak(text, hits, search_mod.allowed_sections(role),
+                                      products=product_rows)
     if leak["leak"]:
         logger.error("ответ содержал фрагменты из недоступных роли «%s» разделов: "
                      "%s — выдача заменена отказом", role, leak["sections"])
@@ -286,11 +293,31 @@ def record_feedback(query_id: int, user_id: int, verdict: str, comment: str = ""
 
 
 def add_golden(question: str, answer_text: str, author_id: int | None = None,
-               source_refs: list | None = None) -> int:
+               source_refs: list | None = None,
+               sections: list[str] | None = None) -> int:
+    """
+    Добавляет выверенный ответ.
+
+    `sections` — разделы, к которым ответ относится. Пусто означает
+    «ответ общий, виден всем ролям». Если не указано явно, разделы
+    берутся из источников: ответ, собранный из дилерского прайса, должен
+    остаться дилерским, даже если эксперт об этом не подумал.
+    """
+    if sections is None and source_refs:
+        found: set[str] = set()
+        for ref in source_refs:
+            chunk_id = ref.get("chunk_id") if isinstance(ref, dict) else None
+            if not chunk_id:
+                continue
+            row = db.q1("SELECT d.section FROM chunks c JOIN documents d "
+                        "ON d.id=c.doc_id WHERE c.id=?", (chunk_id,))
+            if row and row["section"]:
+                found.add(row["section"])
+        sections = sorted(found)
     cur = db.run("""INSERT INTO golden_qa(question, answer, source_refs, author_id,
-                    created_at, updated_at) VALUES (?,?,?,?,?,?)""",
+                    created_at, updated_at, sections) VALUES (?,?,?,?,?,?,?)""",
                  (question, answer_text, json.dumps(source_refs or [], ensure_ascii=False),
-                  author_id, _now(), _now()))
+                  author_id, _now(), _now(), "|".join(sections or [])))
     gid = int(cur.lastrowid)
     db.run("INSERT INTO golden_fts(rowid, question, answer) VALUES (?,?,?)",
            (gid, question, answer_text))

@@ -56,6 +56,46 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
+def env_mtime() -> float:
+    """Когда .env менялся в последний раз. 0, если файла нет."""
+    env_file = BASE_DIR / ".env"
+    try:
+        return env_file.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def reload_if_changed() -> bool:
+    """
+    Перечитать настройки, если файл изменился.
+
+    Нужно соседним процессам. Настройки правят в админке, а бот, слежение
+    за папкой и телефония — отдельные процессы (в контейнерах вообще
+    отдельные контейнеры). Раньше они работали со старыми значениями до
+    ручного перезапуска, и это никак не показывалось: администратор
+    менял порог отказа, проверял в админке — работает, а бот продолжал
+    отвечать по-старому неделями.
+
+    Проверка дешёвая: один stat файла. Вызывается из основного цикла.
+    """
+    now = env_mtime()
+    if not now:
+        return False
+    # Отметку держим в окружении, а не в переменной модуля: перечитывание
+    # выполняет тело модуля заново, и обычная переменная обнулилась бы —
+    # получился бы бесконечный цикл перечитываний.
+    seen = os.environ.get("_KB_ENV_MTIME", "")
+    if seen == f"{now:.6f}":
+        return False
+    os.environ["_KB_ENV_MTIME"] = f"{now:.6f}"
+    if not seen:                      # первый вызов — просто запомнили
+        return False
+    import importlib
+    import sys as _sys
+    importlib.reload(_sys.modules[__name__])
+    return True
+
+
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
@@ -205,6 +245,20 @@ ADMIN_SESSION_HOURS = _env_int("ADMIN_SESSION_HOURS", 12)
 # Роли админки: viewer — только смотреть, operator — запускать задачи,
 # admin — менять настройки, восстанавливать индекс, выдавать доступ.
 ADMIN_DEFAULT_ROLE = _env("ADMIN_DEFAULT_ROLE", "viewer")
+
+# Подбор пароля. Задержка после неудачной попытки от перебора не спасает:
+# сервер многопоточный, и сотня одновременных соединений даёт сотню
+# попыток в секунду, сколько ни спи внутри каждой. Спасает счётчик.
+ADMIN_LOGIN_MAX_FAILS = _env_int("ADMIN_LOGIN_MAX_FAILS", 10)
+ADMIN_LOGIN_BLOCK_MINUTES = _env_int("ADMIN_LOGIN_BLOCK_MINUTES", 15)
+
+# Стоит ли перед админкой свой обратный прокси. Признак нельзя выводить
+# автоматически: заголовки X-Forwarded-* ставит кто угодно. А цена
+# ошибки высокая — при прокси на той же машине адресом клиента для всех
+# внешних запросов становится 127.0.0.1, и правило «с локального адреса
+# можно всё» открывает админку всему интернету. Поэтому: включили —
+# верим заголовкам прокси и обязательно заводим учётные записи.
+ADMIN_TRUST_PROXY = _env("ADMIN_TRUST_PROXY", "0") == "1"
 
 # Ограничение частоты обращений к боту: защита бюджета на модель и от
 # случайного прогона всей базы вопросами.
@@ -440,6 +494,12 @@ CRAWL_MAX_PAGES = _env_int("CRAWL_MAX_PAGES", 500)
 CRAWL_DELAY_SECONDS = _env_float("CRAWL_DELAY_SECONDS", 1.5)
 CRAWL_RENDER_JS = _env("CRAWL_RENDER_JS", "0") == "1"       # нужен playwright
 CRAWL_RESPECT_ROBOTS = _env("CRAWL_RESPECT_ROBOTS", "1") == "1"
+# Разрешить обходчику ходить на внутренние адреса. По умолчанию нельзя:
+# цель для обхода выбираем не мы, а чужие ссылки и чужие карты сайта, и
+# взломанному сайту достаточно поставить ссылку на служебный адрес
+# облака, чтобы наш сервер сходил туда сам и положил ответ в базу.
+# Включать только для обхода своего внутреннего портала.
+CRAWL_ALLOW_PRIVATE = _env("CRAWL_ALLOW_PRIVATE", "0") == "1"
 CRAWL_USER_AGENT = _env("CRAWL_USER_AGENT",
                         "KB-Assistant/1.0 (внутренний ассистент; контакт: it@company.ru)")
 
@@ -533,7 +593,23 @@ ARI_URL = _env("ARI_URL", "http://127.0.0.1:8088")
 ARI_USER = _env("ARI_USER", "")
 ARI_PASSWORD = _env("ARI_PASSWORD", "")
 ARI_APP = _env("ARI_APP", "kb-assistant")
-AUDIOSOCKET_HOST = _env("AUDIOSOCKET_HOST", "0.0.0.0")
+# Адрес приёма звука от станции. По умолчанию только локальный: у этого
+# порта нет никакой авторизации, и любой, кто до него дотянулся, получал
+# ответы по базе знаний голосом. Если станция на другой машине —
+# поставьте её адрес, а не 0.0.0.0.
+AUDIOSOCKET_HOST = _env("AUDIOSOCKET_HOST", "127.0.0.1")
+
+# Кто звонит и что ему можно. Формат: номер:роль через запятую.
+# У телефона нет входа по паролю, поэтому опознание только по номеру.
+SIP_KNOWN_CALLERS = _env("SIP_KNOWN_CALLERS", "")
+# Роль для всех остальных. Намеренно отдельная от DEFAULT_ROLE: то, что
+# можно сотруднику в Telegram, не обязано быть можно любому дозвонившемуся.
+SIP_GUEST_ROLE = _env("SIP_GUEST_ROLE", "guest")
+# Принимать звонки только с известных номеров.
+SIP_ONLY_KNOWN_CALLERS = _env("SIP_ONLY_KNOWN_CALLERS", "0") == "1"
+# Ограничения на канал: иначе один скрипт выжигает бюджет на модель.
+SIP_MAX_CALLS_PER_HOUR = _env_int("SIP_MAX_CALLS_PER_HOUR", 20)
+SIP_MAX_TURNS = _env_int("SIP_MAX_TURNS", 15)
 AUDIOSOCKET_PORT = _env_int("AUDIOSOCKET_PORT", 8090)
 SIP_GREETING = _env("SIP_GREETING", "Здравствуйте! Задайте вопрос по базе знаний "
                                     "после сигнала.")

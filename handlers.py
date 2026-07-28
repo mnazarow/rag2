@@ -219,7 +219,7 @@ def _restore_drill(payload: dict, progress) -> dict:
         return {"archive": target.name, "verified": True, "searched": False,
                 **report["counts"]}
 
-    work = _P(tempfile.mkdtemp(prefix="kb_drill_"))
+    work = backup.workdir("kb_drill_")
     saved_data, saved_db = cfg.DATA_DIR, cfg.DB_PATH
     try:
         import tarfile
@@ -266,3 +266,23 @@ def _contextual(payload: dict, progress) -> dict:
 def _media(payload: dict, progress) -> dict:
     import media
     return media.transcribe_queue(limit=payload.get("limit"), progress=progress)
+
+
+@jobs.handler("model_install")
+def _model_install(payload: dict, progress) -> dict:
+    """
+    Загрузка весов модели.
+
+    Через очередь, а не фоновым потоком из веб-обработчика. Раньше поток
+    был демоном и учитывался только в памяти процесса: перезапуск админки
+    терял и загрузку, и всякую память о ней, а в папке оставались неполные
+    веса, которые система считала готовой моделью. Дочерний процесс
+    загрузчика при этом переживал остановку и продолжал писать в ту же
+    папку уже после перезапуска.
+    """
+    import models as models_mod
+    model_id = str(payload.get("id") or "")
+    if not model_id:
+        raise ValueError("не указана модель")
+    return models_mod.install(model_id, engine=payload.get("engine") or None,
+                              progress=progress)

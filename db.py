@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -384,8 +385,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
                         ("questions", "INTEGER DEFAULT 0")):
         if column not in have_u:
             _add_column(conn, "users", column, ddl)
-    conn.execute("UPDATE users SET status='approved' WHERE approved=1 AND "
-                 "(status IS NULL OR status='new')")
+    # Разовое согласование старых записей с новой колонкой. Раньше этот
+    # UPDATE выполнялся при каждом открытии соединения, а соединение
+    # заводится на каждый поток, то есть на каждый запрос к админке. Это
+    # означало транзакцию записи на каждый просмотр страницы —
+    # конкурирующую за блокировку базы с идущей индексацией. Условие
+    # ниже делает его настоящим no-op, когда согласовывать нечего.
+    if conn.execute("SELECT 1 FROM users WHERE approved=1 AND "
+                    "(status IS NULL OR status='new') LIMIT 1").fetchone():
+        conn.execute("UPDATE users SET status='approved' WHERE approved=1 AND "
+                     "(status IS NULL OR status='new')")
+
+    # Выверенные ответы пишет человек, и они запросто содержат дилерские
+    # условия: эксперт отвечал на вопрос дилера и о разграничении не думал.
+    # Этот канал идёт первым и раньше проверок не проходил вовсе, то есть
+    # был самым коротким путём к утечке. Пустое значение означает «ответ
+    # общий», список разделов — «виден только тем, кому открыты все они».
+    have_g = {r[1] for r in conn.execute("PRAGMA table_info(golden_qa)")}
+    for column, ddl in (("sections", "TEXT"),):
+        if column not in have_g:
+            _add_column(conn, "golden_qa", column, ddl)
 
     have_q = {r[1] for r in conn.execute("PRAGMA table_info(queries)")}
     for column, ddl in (("route", "TEXT"),            # golden|price|documents|none
@@ -432,6 +451,38 @@ def runmany(sql: str, seq: Iterable[Sequence[Any]]) -> None:
 
 
 # --------------------------------------------------------------- векторы ----
+def atomic_write(path: Path, write: "Callable[[Any], Any]") -> None:
+    """
+    Записать файл так, чтобы он никогда не оказался наполовину записанным.
+
+    Пишем во временный файл рядом, сбрасываем на диск и переименовываем.
+    Переименование внутри одной файловой системы атомарно: читатель видит
+    либо старое содержимое целиком, либо новое целиком, и никогда —
+    обрезанное. Для индекса, модели поиска и файла настроек это
+    принципиально: обрезанный файл система читает молча и продолжает
+    работать «как будто ничего нет», а обнаруживается это по жалобам
+    через недели.
+
+    Временный файл кладём рядом, а не в /tmp: переименование между
+    разными файловыми системами не атомарно и вырождается в копирование.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    try:
+        with open(tmp, "wb") as fh:
+            write(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 class VectorStore:
     """
     Плоский индекс в numpy: cosine = dot(нормированные векторы).
@@ -450,18 +501,53 @@ class VectorStore:
 
     # --- персистентность ---
     def load(self) -> None:
-        if Path(config.VECTORS_PATH).exists() and Path(config.VECTOR_IDS_PATH).exists():
-            try:
-                self.matrix = np.load(config.VECTORS_PATH)
-                self.ids = json.loads(Path(config.VECTOR_IDS_PATH).read_text())
-                self.dim = self.matrix.shape[1] if self.matrix.size else self.dim
-                self._index = {cid: i for i, cid in enumerate(self.ids)}
-            except Exception:
-                self.ids, self.matrix, self._index = [], np.zeros((0, self.dim), np.float32), {}
+        """
+        Читает векторы с диска.
+
+        Ошибку чтения раньше гасили молча, обнуляя индекс. Это худшее из
+        возможных поведений: система поднимается как ни в чём не бывало,
+        смысловой канал поиска исчезает, а узнают об этом по жалобам
+        сотрудников через недели. Теперь повреждение — громкая запись в
+        журнал и пометка, которую видно в диагностике.
+        """
+        self.broken = ""
+        if not (Path(config.VECTORS_PATH).exists()
+                and Path(config.VECTOR_IDS_PATH).exists()):
+            return
+        try:
+            matrix = np.load(config.VECTORS_PATH)
+            ids = json.loads(Path(config.VECTOR_IDS_PATH).read_text())
+            # Рассогласование — тоже повреждение: обычно это остановка
+            # процесса между записью двух файлов.
+            if len(ids) != matrix.shape[0]:
+                raise ValueError(f"векторов {matrix.shape[0]}, идентификаторов "
+                                 f"{len(ids)} — файлы рассогласованы")
+            self.matrix, self.ids = matrix, ids
+            self.dim = self.matrix.shape[1] if self.matrix.size else self.dim
+            self._index = {cid: i for i, cid in enumerate(self.ids)}
+        except Exception as exc:  # noqa: BLE001
+            self.broken = str(exc)
+            self.ids, self.matrix, self._index = [], np.zeros((0, self.dim), np.float32), {}
+            import logging_setup
+            logging_setup.get("db").error(
+                "векторный индекс повреждён (%s). Смысловой поиск отключён, "
+                "работает только поиск по точным словам. Восстановите из копии "
+                "или пересчитайте: python index.py reembed", exc)
 
     def save(self) -> None:
-        np.save(config.VECTORS_PATH, self.matrix)
-        Path(config.VECTOR_IDS_PATH).write_text(json.dumps(self.ids))
+        """
+        Сохраняет векторы.
+
+        Пишем во временные файлы и переименовываем. Переименование внутри
+        одной файловой системы атомарно, поэтому на диске всегда лежит
+        либо старая пара файлов целиком, либо новая целиком. Раньше
+        запись шла поверх и двумя отдельными шагами, а остановка процесса
+        между ними (при `docker stop` это происходило каждый раз)
+        оставляла обрезанный файл векторов или рассогласованную пару.
+        """
+        atomic_write(Path(config.VECTORS_PATH), lambda fh: np.save(fh, self.matrix))
+        atomic_write(Path(config.VECTOR_IDS_PATH),
+                     lambda fh: fh.write(json.dumps(self.ids).encode()))
 
     # --- запись ---
     def add(self, chunk_ids: Sequence[int], vectors: np.ndarray) -> None:

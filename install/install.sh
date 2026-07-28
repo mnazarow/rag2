@@ -225,6 +225,9 @@ if [ "$DRY_RUN" = 0 ]; then
 import llm_queue, config
 llm_queue.ensure_tables()
 print(f'  очередь к модели: не больше {config.LLM_MAX_CONCURRENT} запросов одновременно')" )
+  say "Проверяю настройку перед первым запуском"
+  ( cd "$TARGET" && "$VENV_PY" preflight.py ) || \
+    warn "Проверка нашла то, что нужно исправить до запуска (см. выше)"
 fi
 if [ "$WITH_SERVICE" = 1 ]; then
   if [ "$PLATFORM" = linux ] && command -v systemctl >/dev/null 2>&1; then
@@ -242,6 +245,10 @@ WorkingDirectory=$TARGET
 ExecStart=$VENV_PY $TARGET/webui.py
 Restart=on-failure
 RestartSec=10
+# Даём дописать индекс: остановка посреди записи оставляет обрезанный
+# файл векторов, и смысловой поиск после этого молча исчезает.
+KillSignal=SIGTERM
+TimeoutStopSec=40
 StandardOutput=append:$TARGET/logs/service.log
 StandardError=append:$TARGET/logs/service.log
 
@@ -304,7 +311,11 @@ cat <<DONE
   8. Запустите веб-интерфейс:
        $TARGET/venv/bin/python $TARGET/webui.py
      и откройте http://127.0.0.1:8800
-  9. Для Telegram укажите в .env токен бота и запустите:
+  9. Перед выставлением админки наружу проверьте настройку:
+       $TARGET/venv/bin/python $TARGET/preflight.py
+     Она не даст запуститься с открытым наружу интерфейсом без пароля и
+     с ролью по умолчанию, которой нет в разграничении доступа.
+ 10. Для Telegram укажите в .env токен бота и запустите:
        $TARGET/venv/bin/python $TARGET/bot.py
 
 Обновление: $TARGET/install/update.sh

@@ -31,6 +31,7 @@ import embeddings
 import extract
 import logging_setup
 import prices
+import shutdown
 
 log = logging_setup.get("index")
 
@@ -280,6 +281,15 @@ def build(force: bool = False, limit: int | None = None, verbose: bool = False,
             if verbose:
                 print(f"   сбой на {path.name}: {exc}")
         counts[status] = counts.get(status, 0) + 1
+        # Останавливаться нужно в точке, где данные согласованы, а не там,
+        # где застал сигнал. Дописываем векторы и выходим: обработанное
+        # сохранено, следующий запуск продолжит с этого места.
+        if shutdown.stopping():
+            db.vectors().save()
+            say(f"Остановка по сигналу: обработано {i} из {total}. "
+                "Запустите индексацию снова — продолжится с этого места.")
+            emit("extract", "ok", f"остановлено на {i} из {total}", i, total)
+            return counts
         if i % 25 == 0 or i == total:
             emit("extract", "running" if i < total else "ok",
                  f"обработано {i} из {total}", i, total)
@@ -495,6 +505,7 @@ def ocr_queue() -> None:
 def main() -> None:
     import signal
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # тихий выход при | head
+    shutdown.install("индексация")
 
     parser = argparse.ArgumentParser(description="Индексация корпоративной базы знаний")
     parser.add_argument("command", choices=["build", "update", "watch", "stats", "repair",

@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import subprocess
@@ -31,6 +32,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -156,6 +158,73 @@ def read_env() -> dict:
     return out
 
 
+# Ошибки, которые можно показать целиком: они говорят о действии
+# пользователя, а не об устройстве сервера.
+_SAFE_ERRORS = ("Busy", "ValueError", "LLMBusy", "Blocked", "OcrError")
+
+
+def safe_error(exc: BaseException, context: str = "") -> str:
+    """
+    Что показать в интерфейсе вместо текста исключения.
+
+    Текст исключения сплошь и рядом содержит абсолютные пути, имена
+    внутренних хостов, куски ответов провайдеров и версии библиотек. Всё
+    это — карта сервера для того, кто до админки дотянулся, и она же
+    ничего не говорит человеку, который просто нажал кнопку. Поэтому
+    наружу идёт понятная фраза и номер, по которому в журнале лежат
+    подробности; в журнал пишется всё как есть.
+
+    Исключения, которые мы бросаем сами и которые описывают действие
+    пользователя («уже выполняется», «модель занята»), показываются
+    целиком: в них нет ничего внутреннего, а польза прямая.
+    """
+    name = type(exc).__name__
+    if name in _SAFE_ERRORS:
+        return str(exc)
+    ticket = uuid.uuid4().hex[:8]
+    log.error("[%s] %s%s: %s", ticket, context, " — " if context else "",
+              exc, exc_info=True)
+    return (f"Не удалось выполнить. Подробности в журнале по номеру {ticket} "
+            f"(раздел «Журналы», поиск по номеру).")
+
+
+def _audit_safe_changes(changed: dict, before: dict) -> dict:
+    """
+    Что записать в журнал действий об изменении настроек.
+
+    Для обычных настроек — было и стало: без этого разбор «когда у нас
+    поехал порог отказа» невозможен. Для ключей — только факт замены:
+    само значение в журнал попадать не должно ни при каких условиях.
+    """
+    secret_keys = {s["key"] for s in settings_schema.SETTINGS
+                   if s["type"] in SECRET_TYPES}
+    out = {}
+    for key, value in list(changed.items())[:30]:
+        if key in secret_keys:
+            out[key] = ["<был задан>" if before.get(key) else "<не был задан>",
+                        "<заменён>" if str(value).strip() else "<стёрт>"]
+        else:
+            out[key] = [before.get(key), value]
+    return out
+
+
+def _behind_https(handler) -> bool:
+    """
+    Пришёл ли запрос по https.
+
+    Прямо это не видно: сервер слушает голый http, TLS завершает
+    обратный прокси. Прокси сообщает об этом заголовком, но заголовок
+    клиентский — верить ему можно, только если мы точно знаем, что перед
+    нами свой прокси. Отсюда настройка ADMIN_TRUST_PROXY: без неё
+    заголовки игнорируются, потому что иначе любой клиент объявляет свой
+    запрос защищённым и локальным.
+    """
+    if not config.ADMIN_TRUST_PROXY:
+        return False
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
+    return proto.lower() == "https"
+
+
 SECRET_TYPES = {"secret"}
 
 
@@ -218,7 +287,11 @@ def write_env(updates: dict) -> None:
     if extra:
         lines.append("\n# ---- прочее ----")
         lines += [f"{k}={current[k]}" for k in extra]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Через временный файл: обрезанный .env система читает молча и
+    # поднимается на значениях по умолчанию — с другой папкой базы и
+    # другим провайдером модели.
+    db.atomic_write(path, lambda fh: fh.write(
+        ("\n".join(lines) + "\n").encode("utf-8")))
     log.info("настройки сохранены: изменено ключей %d", len(plain))
 
 
@@ -271,6 +344,30 @@ RELOAD_MAP = {
                  "RATE_LIMIT_PER_USER_HOUR", "RATE_LIMIT_PER_USER_DAY",
                  "RATE_LIMIT_TOTAL_DAY"),
 }
+
+
+# Настройки, которые нельзя перечитывать на ходу во время длительной
+# операции: смена провайдера или размерности векторов посреди
+# переиндексации даёт следующую пачку другой размерности, задача рвётся
+# на середине, а уже записанная часть векторов остаётся в файле.
+_UNSAFE_WHILE_BUSY = {
+    "EMBEDDINGS_PROVIDER", "EMBEDDINGS_MODEL", "EMBEDDINGS_DIM", "LSA_DIM",
+    "LSA_MAX_FEATURES", "LSA_MIN_DF", "ONNX_MODEL_PATH", "VECTOR_BACKEND",
+    "QDRANT_URL", "QDRANT_COLLECTION", "DATA_DIR", "KB_ROOT",
+}
+
+
+def busy_with_indexing() -> str:
+    """Идёт ли сейчас работа, которой помешает смена настроек."""
+    try:
+        import jobs
+        for job in jobs.recent(20):
+            if job["status"] == "running" and \
+                    set(jobs.RESOURCES.get(job["kind"], ())) & {"index", "vectors", "model"}:
+                return job.get("title") or job["kind"]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def _reload_after_settings(changed: dict) -> list[str]:
@@ -1691,10 +1788,10 @@ async function restoreBackup(){
     headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
   $('bkRestoreOut').innerHTML=r.error
     ? `<div class="panel bad">${esc(r.error)}</div>`
-    : `<div class="panel"><div class="good">Восстановлено: ${esc((r.restored||[]).join(', '))}</div>
-       <div class="muted" style="margin-top:6px">Прежнее состояние сохранено в
-       <code>${esc(r.previous)}</code>. Проверьте поиск — если всё в порядке,
-       эту папку можно удалить.</div></div>`;
+    : `<div class="panel"><div class="good">${esc(r.message||'Поставлено в очередь')}</div>
+       <div class="muted" style="margin-top:6px">Прежнее состояние система
+       отложит рядом, в папке <code>before-restore-*</code>: если после
+       восстановления поиск ведёт себя не так, откат займёт минуту.</div></div>`;
   loadBackup();
 }
 
@@ -2613,42 +2710,100 @@ class Handler(BaseHTTPRequestHandler):
         токену. Если нет ни того ни другого — только с локального адреса:
         открытая наружу админка без всякой проверки означает, что любой,
         кто дотянулся до порта, может восстановить индекс из копии.
+
+        Отдельно про «локальный адрес». Когда перед админкой стоит
+        обратный прокси на той же машине — обычная и рекомендуемая
+        схема, — адресом клиента для всех внешних запросов становится
+        127.0.0.1. То есть правило «с локального адреса можно всё»
+        открывало админку без пароля всему интернету, причём именно в той
+        конфигурации, которую сами же и советуем. Теперь при
+        ADMIN_TRUST_PROXY признаком «свой» служит не адрес соединения, а
+        адрес из X-Forwarded-For, и пускать он не будет никого, кроме
+        локальных; а вход по паролю в такой схеме нужен обязательно.
         """
         import security
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/login", "/api/login", "/api/whoami"):
+        if path in ("/login", "/api/login", "/healthz"):
             return True
         if security.accounts_enabled():
             account = self._account()
             if account is None:
                 return False
-            return security.may(account["role"], self.command, path)
+            # Тело запроса нужно правилам: один и тот же путь /api/job
+            # запускает и переиндексацию, и восстановление из копии.
+            payload = self._peek_body() if self.command == "POST" else None
+            return security.may(account["role"], self.command, path, payload)
         if config.ADMIN_TOKEN:
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            return (self.headers.get("X-Admin-Token") or query.get("token", [""])[0]) \
-                == config.ADMIN_TOKEN
-        host = (self.client_address[0] if self.client_address else "")
-        if host in ("127.0.0.1", "::1", "localhost"):
-            return True
-        log.error("отказано в доступе к админке с адреса %s: ни учётных записей, "
-                  "ни токена не настроено", host)
-        return False
+            # Токен принимается заголовком или куком. В query-строке он
+            # оседает в журналах прокси, в истории браузера и в Referer
+            # при первом же переходе по внешней ссылке, поэтому из ссылки
+            # он принимается ровно один раз — при открытии страницы, где
+            # тут же перекладывается в кук, а адрес очищается.
+            given = self.headers.get("X-Admin-Token") or self._cookie("kb_token")
+            return hmac.compare_digest(given, config.ADMIN_TOKEN)
+        if not self._client_is_local():
+            log.error("отказано в доступе к админке с адреса %s: ни учётных записей, "
+                      "ни токена не настроено", self._client_ip())
+            return False
+        return True
+
+    def _client_ip(self) -> str:
+        """Настоящий адрес клиента с учётом обратного прокси."""
+        direct = self.client_address[0] if self.client_address else ""
+        if config.ADMIN_TRUST_PROXY:
+            forwarded = (self.headers.get("X-Forwarded-For") or "").split(",")
+            if forwarded and forwarded[0].strip():
+                return forwarded[0].strip()
+        return direct
+
+    def _client_is_local(self) -> bool:
+        return self._client_ip() in ("127.0.0.1", "::1", "localhost")
+
+    def _safe_job(self, job: dict | None) -> dict | None:
+        """
+        Карточка задачи без внутренних подробностей.
+
+        В `error` у упавшей задачи лежит полная трассировка: пути в
+        файловой системе, имена модулей, куски окружения. Смотреть на неё
+        может любая роль — все GET открыты, — а чинить всё равно будет
+        администратор, у которого есть журнал. Поэтому ролям ниже admin
+        отдаём первую строку ошибки, без стека.
+        """
+        if not job:
+            return job
+        import security
+        account = self._account()
+        role = (account or {}).get("role") if security.accounts_enabled() else "admin"
+        if role == "admin" or not job.get("error"):
+            return job
+        first = str(job["error"]).strip().splitlines()[-1][:200]
+        return {**job, "error": first,
+                "error_note": "полный текст ошибки виден администратору"}
 
     def _who(self) -> str:  # noqa: D401
         """
         Кто выполнил действие — для журнала.
 
-        Полноценного входа по учётной записи пока нет, поэтому пишем то,
-        что достоверно известно: адрес и имя, если его передал обратный
-        прокси с корпоративной авторизацией. Это честнее, чем писать
-        «администратор» и делать вид, что автор установлен.
+        Пишем только то, что действительно установлено. Имя из учётной
+        записи — установлено: человек ввёл пароль. Имя из заголовка
+        X-Admin-User — установлено лишь тогда, когда его проставил свой
+        обратный прокси; сам по себе это обычный клиентский заголовок,
+        который подставляется одной строкой curl. Раньше он принимался
+        всегда, то есть запись в журнале о восстановлении индекса
+        указывала на того, на кого захотел указать отправитель, — журнал
+        аудита, ради которого всё и заводилось, подделывался тривиально.
+        Теперь заголовку верим только при ADMIN_TRUST_PROXY.
         """
         account = self._account()
-        addr = self.client_address[0] if self.client_address else "?"
+        addr = self._client_ip() or "?"
         if account:
             return f"{account.get('full_name') or account['login']} ({addr})"
-        name = self.headers.get("X-Admin-User") or self.headers.get("X-Forwarded-User")
-        return f"{name} ({addr})" if name else f"админка, {addr}"
+        if config.ADMIN_TRUST_PROXY:
+            name = (self.headers.get("X-Admin-User")
+                    or self.headers.get("X-Forwarded-User"))
+            if name:
+                return f"{name[:60]} ({addr}, по данным прокси)"
+        return f"админка, {addr}"
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
         self.send_response(code)
@@ -2664,19 +2819,77 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(data, ensure_ascii=False, default=str).encode())
 
     def _body(self) -> dict:
+        return self._peek_body()
+
+    def _peek_body(self) -> dict:
+        """
+        Тело запроса, прочитанное один раз.
+
+        Читать `rfile` дважды нельзя, а тело нужно и проверке прав (там
+        решает вид задачи), и самому обработчику. Поэтому читаем один раз
+        и запоминаем.
+        """
+        cached = getattr(self, "_body_cache", None)
+        if cached is not None:
+            return cached
         length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
-        try:
-            return json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            return {}
+        body: dict = {}
+        if length:
+            try:
+                body = json.loads(self.rfile.read(length))
+            except (json.JSONDecodeError, ValueError):
+                body = {}
+        if not isinstance(body, dict):
+            body = {}
+        self._body_cache = body
+        return body
+
+    def _csrf_ok(self) -> bool:
+        """
+        Защита от запроса, отправленного чужой страницей.
+
+        Требуем `Content-Type: application/json`. Обычная HTML-форма
+        такой заголовок поставить не может, а запрос из скрипта на чужом
+        сайте с ним требует разрешения CORS, которого мы не даём. Проверка
+        нужна во всех режимах: `SameSite=Strict` у куки закрывает только
+        вход по учётной записи, а в режимах «общий токен» и «только с
+        локального адреса» куки нет вовсе — там авторизует сам факт
+        запроса с этой машины. То есть страница, открытая администратором
+        в соседней вкладке, могла отправить `POST /api/job` с
+        восстановлением индекса, и это сработало бы.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ctype == "application/json"
 
     # ------------------------------------------------------------- GET ------
     def do_GET(self) -> None:  # noqa: N802, C901
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
         import security
+
+        # Проверка живости — без авторизации и без обращения к базе.
+        # Иначе получается ловушка: как только админку закрывают токеном,
+        # проверка живости контейнера начинает получать 401, докер считает
+        # контейнер больным и перезапускает его по кругу.
+        if path == "/healthz":
+            return self._send(200, b'{"ok": true}')
+
+        # Общий токен из ссылки принимается один раз: перекладываем его в
+        # кук и очищаем адрес, чтобы дальше он не светился ни в истории
+        # браузера, ни в Referer, ни в журнале обратного прокси.
+        if config.ADMIN_TOKEN and not security.accounts_enabled() \
+                and query.get("token") and path in ("/", "/index.html"):
+            if hmac.compare_digest(query["token"][0], config.ADMIN_TOKEN):
+                secure = "; Secure" if _behind_https(self) else ""
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie",
+                                 f"kb_token={config.ADMIN_TOKEN}; Path=/; HttpOnly; "
+                                 f"SameSite=Strict; Max-Age=43200{secure}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+
         if not self._authorized():
             if security.accounts_enabled() and path in ("/", "/index.html"):
                 return self._send(200, LOGIN_PAGE.encode(), "text/html")
@@ -2845,11 +3058,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/jobs":
             import jobs
-            return self._json({"jobs": jobs.recent(40)})
+            return self._json({"jobs": [self._safe_job(j) for j in jobs.recent(40)]})
 
         if path == "/api/jobs/one":
             import jobs
-            return self._json(jobs.get(int(query.get("id", ["0"])[0])))
+            return self._json(self._safe_job(
+                jobs.get(int(query.get("id", ["0"])[0]))))
 
         if path == "/api/adminlog":
             return self._json({"entries": audit_log(
@@ -2994,7 +3208,7 @@ class Handler(BaseHTTPRequestHandler):
                 import voice
                 return self._json({"voices": voice.voices()})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"voices": [], "error": str(exc)})
+                return self._json({"voices": [], "error": safe_error(exc, "список голосов")})
 
         if path == "/api/sip":
             import sip
@@ -3059,6 +3273,8 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------ POST ------
     def do_POST(self) -> None:  # noqa: N802, C901
         path = urllib.parse.urlparse(self.path).path
+        if not self._csrf_ok():
+            return self._send(415, b'{"error":"nuzhen Content-Type: application/json"}')
         if not self._authorized():
             return self._send(401, b"unauthorized", "text/plain")
         payload = self._body()
@@ -3066,21 +3282,37 @@ class Handler(BaseHTTPRequestHandler):
         # --------------------------------------------------------- вход ----
         if path == "/api/login":
             import security
-            account = security.check_password(str(payload.get("login", "")),
-                                              str(payload.get("password", "")))
+            addr = self.client_address[0] if self.client_address else "?"
+            login = str(payload.get("login", ""))
+            # Подбор пароля должен упираться в счётчик, а не в задержку.
+            # Задержка здесь не мешала вовсе: сервер многопоточный, и
+            # двести одновременных соединений давали двести попыток в
+            # секунду, сколько ни спи в каждой из них.
+            gate = security.login_attempt_allowed(login, addr)
+            if not gate["ok"]:
+                log.error("вход заблокирован после серии неудачных попыток: "
+                          "%s с адреса %s", login, addr)
+                return self._json({"error": gate["message"]}, 429)
+            account = security.check_password(login, str(payload.get("password", "")))
             if account is None:
-                log.warning("неудачная попытка входа в админку: %s с адреса %s",
-                            payload.get("login"), self.client_address[0]
-                            if self.client_address else "?")
-                # Задержка, чтобы подбор пароля не был бесплатным.
+                left = security.login_failed(login, addr)
+                log.warning("неудачная попытка входа в админку: %s с адреса %s "
+                            "(осталось попыток: %d)", login, addr, left)
                 time.sleep(1.0)
                 return self._json({"error": "неверный логин или пароль"}, 401)
+            security.login_succeeded(login, addr)
             token = security.open_session(account)
             body = json.dumps({"ok": True, "account": account}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            # Secure ставим, когда снаружи https: за обратным прокси об
+            # этом говорит X-Forwarded-Proto, но верить заголовку можно
+            # только если прокси свой — отсюда отдельная настройка.
+            secure = "; Secure" if _behind_https(self) else ""
             self.send_header("Set-Cookie",
-                             f"kb_session={token}; Path=/; HttpOnly; SameSite=Strict")
+                             f"kb_session={token}; Path=/; HttpOnly; "
+                             f"SameSite=Strict; Max-Age="
+                             f"{int(config.ADMIN_SESSION_HOURS * 3600)}{secure}")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -3109,7 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                     audit("учётная запись", f"удалена: {payload.get('login')}")
                     return self._json({"ok": ok})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"error": str(exc)}, 400)
+                return self._json({"error": safe_error(exc)}, 400)
             return self._json({"error": "неизвестное действие"}, 400)
 
         if path == "/api/secrets/move":
@@ -3154,11 +3386,35 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "issues": issues,
                                    "errors": len(errors), "warnings": len(warnings)},
                                   200)
+            before = read_env()
             changed = {k: v for k, v in values.items()
-                       if str(read_env().get(k, "")) != str(v)}
+                       if str(before.get(k, "")) != str(v)}
+            # Часть настроек нельзя менять, пока идёт индексация: следующая
+            # пачка векторов пойдёт по другой модели, задача оборвётся, а
+            # записанная часть останется в файле — индекс, собранный из
+            # двух разных моделей, выглядит целым и молча плохо ищет.
+            risky = sorted(set(changed) & _UNSAFE_WHILE_BUSY)
+            busy = busy_with_indexing() if risky else ""
+            if busy:
+                return self._json({
+                    "ok": False, "errors": 1, "warnings": 0,
+                    "issues": [{"key": risky[0], "level": "error",
+                                "title": "Сейчас идёт длительная операция",
+                                "message": f"выполняется «{busy}»",
+                                "hint": "Эти настройки задают, как считаются "
+                                        "векторы. Смена на ходу оборвёт задачу "
+                                        "и оставит индекс, собранный по двум "
+                                        "разным моделям. Дождитесь окончания "
+                                        "или снимите задачу в разделе "
+                                        "«Конвейер»: " + ", ".join(risky)}]}, 200)
             write_env(values)
+            # В журнал пишем, что менялось, но не значения ключей. Иначе
+            # весь смысл выноса ключей в защищённый файл пропадает:
+            # журнал лежит в основной базе, а база — первым файлом в
+            # резервной копии. Один архив у подрядчика — и там открытым
+            # текстом все ключи компании.
             audit("настройки", f"изменено ключей: {len(changed)}",
-                  {k: [read_env().get(k), v] for k, v in list(changed.items())[:30]})
+                  _audit_safe_changes(changed, before))
             _reload_after_settings(changed)
             return self._json({"ok": True, "changed": sorted(changed),
                                "issues": issues})
@@ -3212,7 +3468,7 @@ class Handler(BaseHTTPRequestHandler):
                 logging_setup.set_level(payload["subsystem"], payload["level"])
                 return self._json({"ok": True})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"error": str(exc)}, 400)
+                return self._json({"error": safe_error(exc)}, 400)
 
         # Все длительные операции идут через очередь (jobs.py): она
         # переживает перезапуск процесса и не даёт запустить две задачи,
@@ -3250,7 +3506,7 @@ class Handler(BaseHTTPRequestHandler):
             except jobs.Busy as exc:
                 return self._json({"message": str(exc)}, 409)
             except Exception as exc:  # noqa: BLE001
-                return self._json({"message": f"не удалось поставить задачу: {exc}"}, 500)
+                return self._json({"message": safe_error(exc, "постановка задачи")}, 500)
             audit("задача", titles[kind], payload_clean)
             return self._json({"message": f"Задача поставлена (№{job['id']}). "
                                           f"Ход виден в разделе «Конвейер»."})
@@ -3340,9 +3596,19 @@ class Handler(BaseHTTPRequestHandler):
             model_id = payload.get("id", "")
             try:
                 if action == "install":
-                    start_job(f"загрузка {model_id}", models_mod.install, model_id)
-                    return self._json({"message": "Загрузка запущена. Ход виден "
-                                                  "в разделе «Конвейер»."})
+                    import jobs
+                    try:
+                        job = jobs.enqueue("model_install", f"загрузка {model_id}",
+                                           {"id": model_id},
+                                           created_by=self._who())
+                    except jobs.Busy as exc:
+                        return self._json({"message": str(exc)}, 409)
+                    jobs.start_worker()
+                    audit("загрузка модели", model_id)
+                    return self._json({"message": f"Загрузка поставлена в очередь "
+                                                  f"(№{job['id']}). Ход виден в "
+                                                  f"разделе «Конвейер»; она "
+                                                  f"переживёт перезапуск."})
                 if action == "serve":
                     state = models_mod.serve(model_id)
                     return self._json({"message": f"Модель {model_id} запускается на "
@@ -3352,7 +3618,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"message": "Остановлено." if models_mod.stop()
                                                   else "Ничего не запущено."})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"message": f"Ошибка: {exc}"}, 500)
+                return self._json({"message": safe_error(exc)}, 500)
 
         if path == "/api/tts":
             try:
@@ -3361,7 +3627,7 @@ class Handler(BaseHTTPRequestHandler):
                 voice.synthesize(payload.get("text", ""), out, payload.get("voice") or None)
                 return self._json({"message": "Готово.", "url": "/tts.ogg"})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"message": f"Не вышло: {exc}"})
+                return self._json({"message": safe_error(exc)})
 
         if path == "/api/normalize":
             import voice
@@ -3380,7 +3646,7 @@ class Handler(BaseHTTPRequestHandler):
                                               f"без связей {s['orphans']}, "
                                               f"дубликатов {s['dupes']}"})
             except Exception as exc:  # noqa: BLE001
-                return self._json({"message": f"ошибка: {exc}"}, 500)
+                return self._json({"message": safe_error(exc)}, 500)
 
         if path == "/api/golden":
             import answer as answer_mod
@@ -3408,7 +3674,7 @@ class Handler(BaseHTTPRequestHandler):
                 hits = search_mod.search(question, top_k=10)
                 elapsed = round((time.time() - started) * 1000)
             except Exception as exc:  # noqa: BLE001
-                return self._json({"error": str(exc)}, 500)
+                return self._json({"error": safe_error(exc)}, 500)
             finally:
                 if config.RERANKER_PROVIDER != saved:
                     config.RERANKER_PROVIDER = saved
@@ -3450,11 +3716,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"копия «{wanted}» не найдена"}, 400)
             if path.endswith("verify"):
                 return self._json(backup_mod.verify_archive(target))
+            # Восстановление идёт через очередь, а не прямо в потоке
+            # HTTP-запроса. Причина: восстановление сначала отодвигает
+            # текущие данные в сторону и только потом раскладывает новые.
+            # Обрыв между этими шагами (перезапуск по деплою, закрытая
+            # вкладка, разорванное соединение) оставляет систему вообще
+            # без индекса — при следующем старте она поднимется как
+            # чистая установка, а настоящий индекс будет лежать рядом в
+            # папке before-restore-*, и в интерфейсе об этом ни слова.
+            # Очередь переживает перезапуск и не даёт запуститься второму
+            # восстановлению поверх первого.
+            import jobs
             try:
-                return self._json(backup_mod.restore(
-                    target, force=bool(payload.get("force"))))
+                job = jobs.enqueue("restore", f"восстановление из {target.name}",
+                                   {"name": target.name,
+                                    "force": bool(payload.get("force"))},
+                                   created_by=self._who())
+            except jobs.Busy as exc:
+                return self._json({"error": str(exc)}, 409)
             except Exception as exc:  # noqa: BLE001
-                return self._json({"error": str(exc)}, 400)
+                return self._json({"error": safe_error(exc)}, 400)
+            jobs.start_worker()
+            audit("восстановление индекса", target.name)
+            return self._json({
+                "ok": True, "job": job["id"],
+                "message": f"Восстановление из «{target.name}» поставлено в "
+                           f"очередь (№{job['id']}). Ход виден в разделе "
+                           f"«Конвейер»; бот и поиск на это время лучше не "
+                           f"трогать."})
 
         return self._send(404, b"not found", "text/plain")
 
@@ -3477,23 +3766,61 @@ def _metrics_thread() -> None:
 
 
 def main() -> None:
-    db.init()
+    import preflight
+    import shutdown
+
     logging_setup.setup()
+    db.init()
     ensure_events_table()
     import metrics
     metrics.ensure_tables()
+
+    # Проверка перед стартом. Смысл в том, чтобы нерабочая конфигурация
+    # обнаружилась здесь, а не первым вопросом сотрудника через неделю:
+    # процесс, который поднялся и показывает systemd «active», выглядит
+    # исправным, даже если папки базы знаний не существует.
+    report = preflight.check("админка")
+    print(preflight.render(report))
+    if report["fatal"]:
+        log.error("запуск прерван: %s", "; ".join(report["fatal"]))
+        raise SystemExit(2)
+
+    shutdown.install("админка")
+
     if config.METRICS_ENABLED:
         threading.Thread(target=_metrics_thread, daemon=True).start()
+
+    # Обработчик очереди поднимается вместе с процессом, а не по нажатию
+    # кнопки. Иначе задача, поставленная на повтор и пережившая
+    # перезапуск, не выполнится никогда, а занятый ею ресурс останется
+    # занятым: следующая индексация будет получать отказ «уже выполняется».
+    try:
+        import handlers  # noqa: F401 — регистрация обработчиков задач
+        import jobs
+        jobs.ensure_tables()
+        jobs.reap_stale()
+        jobs.start_worker()
+    except Exception as exc:  # noqa: BLE001 — очередь не должна мешать старту
+        log.error("не удалось поднять обработчик очереди: %s", exc)
+
     srv = ThreadingHTTPServer((config.ADMIN_HOST, config.ADMIN_PORT), Handler)
+    srv.daemon_threads = True
     url = f"http://{config.ADMIN_HOST}:{config.ADMIN_PORT}/"
     log.info("админка запущена: %s", url)
     print(f"Админка запущена: {url}")
     if not config.ADMIN_TOKEN and config.ADMIN_HOST not in ("127.0.0.1", "localhost"):
         print("ВНИМАНИЕ: ADMIN_TOKEN не задан, а интерфейс слушает не только localhost.")
+
+    shutdown.on_stop("закрыть приём запросов", srv.shutdown)
+    shutdown.on_stop("дописать векторы", lambda: db.vectors().save())
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nОстановлено.")
+        pass
+    shutdown.wait_actions()
+    srv.server_close()
+    log.warning("админка остановлена")
+    print("\nОстановлено.")
 
 
 if __name__ == "__main__":

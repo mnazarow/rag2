@@ -367,8 +367,22 @@ def local_path(spec: ModelSpec) -> Path:
     return models_dir() / spec.id
 
 
+# Пока идёт загрузка, рядом с весами лежит этот файл. Он и отличает
+# «скачано полностью» от «скачано наполовину»: раньше признаком готовности
+# был любой файл .safetensors в папке, поэтому оборванная на середине
+# загрузка (перезапуск процесса, разрыв связи) выглядела как готовая
+# модель — и следующий запуск поднимал сервер на неполных весах.
+DOWNLOADING = ".загрузка-не-завершена"
+
+
+def download_in_progress(spec: ModelSpec) -> bool:
+    return (local_path(spec) / DOWNLOADING).exists()
+
+
 def is_installed(spec: ModelSpec) -> bool:
     path = local_path(spec)
+    if download_in_progress(spec):
+        return False
     if path.exists() and any(path.rglob("*.safetensors")):
         return True
     if spec.ollama_tag and shutil.which("ollama"):
@@ -410,6 +424,14 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
 
     target = local_path(spec)
     target.mkdir(parents=True, exist_ok=True)
+    marker = target / DOWNLOADING
+    if marker.exists():
+        say("Найдена незавершённая загрузка — продолжаю с того же места.")
+    marker.write_text(
+        "Загрузка весов не завершена. Пока этот файл на месте, модель\n"
+        "считается неготовой и запустить её нельзя: сервер на неполных\n"
+        "весах падает не сразу, а на первом же нестандартном запросе.\n"
+        "Файл удаляется сам после успешной загрузки.\n", encoding="utf-8")
     cli = shutil.which("hf") or shutil.which("huggingface-cli")
     if cli:
         say(f"Скачиваю веса {spec.repo} в {target}")
@@ -437,6 +459,8 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
         say(f"Скачиваю веса {spec.repo}")
         snapshot_download(spec.repo, local_dir=str(target),
                           endpoint=config.HF_MIRROR or None)
+    # Признак незавершённости снимаем только теперь, когда всё скачано.
+    marker.unlink(missing_ok=True)
     say("Готово.")
     return {"model": spec.id, "engine": engine, "path": str(target)}
 
@@ -489,6 +513,11 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
         if not _has_python_module("vllm"):
             raise RuntimeError("не установлен vllm: pip install vllm")
         path = local_path(spec)
+        if download_in_progress(spec):
+            raise RuntimeError(
+                "загрузка весов этой модели не завершена. Запуск на неполных "
+                "весах даёт сервер, который падает не сразу, а на первом же "
+                "нестандартном запросе. Скачайте модель заново.")
         source = str(path) if path.exists() and any(path.rglob("*.safetensors")) else spec.repo
         cards = len(gpus()) or 1
         cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server",

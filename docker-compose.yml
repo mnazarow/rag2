@@ -25,6 +25,8 @@ services:
     ports:
       - "127.0.0.1:8800:8800"
     command: python webui.py
+    # Время на корректную остановку: успеть дописать индекс.
+    stop_grace_period: 40s
 
   bot:
     image: kb-assistant:latest
@@ -40,6 +42,7 @@ services:
       - ${KB_ROOT:-./kb}:/kb:ro
       - kb-data:/data
     command: python bot.py
+    stop_grace_period: 20s
 
   watcher:
     image: kb-assistant:latest
@@ -55,6 +58,7 @@ services:
       - ${KB_ROOT:-./kb}:/kb:ro
       - kb-data:/data
     command: python watcher.py run
+    stop_grace_period: 20s
 
   # Локальная модель на видеокартах. Включается профилем: --profile gpu
   model:

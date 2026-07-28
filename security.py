@@ -58,11 +58,6 @@ ROLES = {
 ROLE_ORDER = ["viewer", "operator", "admin"]
 
 # Что кому разрешено. Проверяется по префиксу пути запроса.
-PERMISSIONS = {
-    "viewer": ("GET",),
-    "operator": ("GET", "/api/job", "/api/backup/verify"),
-    "admin": ("*",),
-}
 
 
 # ═══════════════════════════════════════════════ хранение ключей ═══════════
@@ -118,7 +113,8 @@ def save_secrets(values: dict[str, str]) -> Path:
     body = ["# Ключи и токены. Файл не попадает в архивы и резервные копии.",
             "# Права 600: читать может только владелец процесса.", ""]
     body += [f"{k}={v}" for k, v in sorted(current.items())]
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    import db
+    db.atomic_write(path, lambda fh: fh.write(("\n".join(body) + "\n").encode("utf-8")))
     try:
         path.chmod(0o600)
     except OSError:
@@ -223,9 +219,13 @@ def _read_users() -> dict:
 
 
 def _write_users(users: dict) -> None:
+    # Через временный файл: обрезанный файл учётных записей читается как
+    # «записей нет», а это молча выключает вход по паролю и возвращает
+    # систему к правилу «с локального адреса можно всё».
+    import db
     path = _users_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+    db.atomic_write(path, lambda fh: fh.write(
+        json.dumps(users, ensure_ascii=False, indent=2).encode("utf-8")))
     try:
         path.chmod(0o600)
     except OSError:
@@ -297,6 +297,72 @@ def accounts_enabled() -> bool:
 # ------------------------------------------------------------- сессии -----
 _sessions: dict[str, dict] = {}
 
+# ────────────────────────────────── подбор пароля ──────────────────────────
+# Счётчик неудачных попыток по паре «логин + адрес». Раньше единственной
+# защитой была секундная задержка после неудачи, и она не защищала:
+# сервер многопоточный, поэтому двести одновременных соединений давали
+# двести попыток в секунду — сколько ни спи внутри каждой.
+#
+# Считаем и по логину, и по адресу отдельно. По логину — чтобы перебор
+# пароля к известной учётной записи упирался в блокировку. По адресу —
+# чтобы перебор самих логинов с одной машины тоже упирался: иначе
+# достаточно менять логин на каждой попытке.
+_login_fails: dict[str, list[float]] = {}
+
+
+def _prune_fails(key: str, window: float) -> list[float]:
+    now = time.time()
+    kept = [t for t in _login_fails.get(key, []) if now - t < window]
+    if kept:
+        _login_fails[key] = kept
+    else:
+        _login_fails.pop(key, None)
+    return kept
+
+
+def login_attempt_allowed(login: str, addr: str) -> dict:
+    """Можно ли вообще пробовать войти прямо сейчас."""
+    window = max(60.0, config.ADMIN_LOGIN_BLOCK_MINUTES * 60)
+    limit = max(1, config.ADMIN_LOGIN_MAX_FAILS)
+    for key, what in ((f"login:{login.lower()}", "для этой учётной записи"),
+                      (f"addr:{addr}", "с этого адреса")):
+        fails = _prune_fails(key, window)
+        if len(fails) >= limit:
+            left = int((window - (time.time() - min(fails))) / 60) + 1
+            return {"ok": False,
+                    "message": (f"Слишком много неудачных попыток входа {what}. "
+                                f"Попробуйте через {left} мин.")}
+    return {"ok": True, "message": ""}
+
+
+def login_failed(login: str, addr: str) -> int:
+    """Записывает неудачу. Возвращает, сколько попыток осталось."""
+    now = time.time()
+    limit = max(1, config.ADMIN_LOGIN_MAX_FAILS)
+    for key in (f"login:{login.lower()}", f"addr:{addr}"):
+        _login_fails.setdefault(key, []).append(now)
+    window = max(60.0, config.ADMIN_LOGIN_BLOCK_MINUTES * 60)
+    used = len(_prune_fails(f"login:{login.lower()}", window))
+    return max(0, limit - used)
+
+
+def login_succeeded(login: str, addr: str) -> None:
+    _login_fails.pop(f"login:{login.lower()}", None)
+    _login_fails.pop(f"addr:{addr}", None)
+
+
+def login_blocks() -> list[dict]:
+    """Кто сейчас заблокирован — для раздела «Безопасность»."""
+    window = max(60.0, config.ADMIN_LOGIN_BLOCK_MINUTES * 60)
+    limit = max(1, config.ADMIN_LOGIN_MAX_FAILS)
+    out = []
+    for key in list(_login_fails):
+        fails = _prune_fails(key, window)
+        if len(fails) >= limit:
+            out.append({"who": key, "fails": len(fails),
+                        "until_min": int((window - (time.time() - min(fails))) / 60) + 1})
+    return out
+
 
 def open_session(user: dict) -> str:
     token = secrets.token_urlsafe(32)
@@ -321,15 +387,33 @@ def close_session(token: str | None) -> None:
     _sessions.pop(token or "", None)
 
 
-def may(role: str, method: str, path: str) -> bool:
-    """Разрешено ли этой роли такое действие."""
+# Виды заданий, которые оператору запускать нельзя. Причина не в самих
+# заданиях, а в том, что очередь — это второй вход к тем же действиям:
+# восстановление индекса закрыто на своём эндпоинте, но точно так же
+# запускается через POST /api/job {"kind": "restore"}. Разграничение,
+# у которого есть обходной путь, не разграничивает ничего.
+ADMIN_ONLY_JOBS = ("restore", "restore_drill", "backup_prune", "retention_clean",
+                   "forget_user", "migrate_vectors", "model_install")
+
+
+def may(role: str, method: str, path: str, payload: dict | None = None) -> bool:
+    """
+    Разрешено ли этой роли такое действие.
+
+    payload нужен там, где один путь ведёт к разным по опасности
+    действиям: `/api/job` запускает и переиндексацию, и восстановление
+    из копии.
+    """
     if role == "admin":
         return True
     if method == "GET":
         return True
     if role == "operator":
+        if path.startswith("/api/job"):
+            kind = str((payload or {}).get("kind") or "")
+            return kind not in ADMIN_ONLY_JOBS
         return any(path.startswith(p) for p in
-                   ("/api/job", "/api/backup/verify", "/api/llm/probe",
+                   ("/api/backup/verify", "/api/llm/probe",
                     "/api/search/test", "/api/ocr/guard"))
     return False
 
@@ -379,19 +463,31 @@ def neutralize(question: str) -> str:
             "не меняются.\n«" + (question or "").replace("»", "").strip() + "»")
 
 
-def check_answer_leak(text: str, hits: list, allowed_sections: set[str] | None) -> dict:
+def check_answer_leak(text: str, hits: list, allowed_sections: set[str] | None,
+                      products: list | None = None) -> dict:
     """
     Не попал ли в ответ текст из недоступного сотруднику раздела.
 
-    Это главная проверка: она ловит утечку независимо от того, каким
-    хитрым способом её добились, потому что смотрит на результат, а не
-    на формулировку вопроса.
+    Это последняя проверка, и главная: она ловит утечку независимо от
+    того, каким способом её добились, потому что смотрит на результат, а
+    не на формулировку вопроса.
+
+    Смотреть надо на всё, что ушло в модель, а не только на фрагменты
+    документов. Позиции прайса подставляются в ответ отдельным блоком с
+    пометкой «точные данные, приоритет над остальным» — и раньше эта
+    проверка их не видела. То есть единственный контур, который должен
+    был ловить утечку «любым способом», не видел ровно того канала, где
+    лежит самое закрытое: цены.
     """
     if not config.PROMPT_GUARD or not allowed_sections:
         return {"leak": False, "sections": []}
-    bad = sorted({h.section for h in (hits or [])
-                  if getattr(h, "section", None) and h.section not in allowed_sections})
-    return {"leak": bool(bad), "sections": bad}
+    bad = {h.section for h in (hits or [])
+           if getattr(h, "section", None) and h.section not in allowed_sections}
+    for row in (products or []):
+        section = row.get("section") if isinstance(row, dict) else None
+        if section and section not in allowed_sections:
+            bad.add(section)
+    return {"leak": bool(bad), "sections": sorted(bad)}
 
 
 SAFE_REFUSAL = ("Этот вопрос затрагивает раздел базы знаний, к которому у вас "

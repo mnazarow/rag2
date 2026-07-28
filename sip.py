@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import re
 import struct
 import sys
 import tempfile
@@ -116,6 +117,56 @@ def check() -> dict:
 
 
 # ------------------------------------------------------- обработка разговора --
+# ───────────────────────── кто звонит и что ему можно ─────────────────────
+# У телефонного канала нет входа по паролю: человек просто дозвонился.
+# Поэтому опознание — по номеру, а всё, что за пределами списка, получает
+# самую ограниченную роль. Раньше здесь стояла DEFAULT_ROLE для всех, и
+# любой дозвонившийся получал ровно тот же доступ, что сотрудник.
+_recent_calls: dict[str, list[float]] = {}
+
+
+def normalize_number(number: str) -> str:
+    """8 (912) 345-67-89 и +79123456789 — один и тот же номер."""
+    digits = re.sub(r"\D", "", number or "")
+    if len(digits) == 11 and digits[0] in "78":
+        digits = "7" + digits[1:]
+    return digits
+
+
+def role_for_caller(caller: str) -> str:
+    """
+    Роль звонящего. Номер из списка — своя роль, остальные — гостевая.
+
+    Гостевая роль намеренно берётся из настройки, а не совпадает с
+    DEFAULT_ROLE: телефон доступен снаружи, и то, что можно сотруднику в
+    Telegram, не обязано быть можно любому дозвонившемуся.
+    """
+    number = normalize_number(caller)
+    for entry in config.SIP_KNOWN_CALLERS.split(","):
+        if ":" not in entry:
+            continue
+        known, role = entry.split(":", 1)
+        if normalize_number(known) and normalize_number(known) == number:
+            return role.strip()
+    return config.SIP_GUEST_ROLE
+
+
+def call_allowed(caller: str) -> tuple[bool, str]:
+    """Не слишком ли часто звонят с этого номера."""
+    number = normalize_number(caller) or "неизвестный"
+    if config.SIP_ONLY_KNOWN_CALLERS and not any(
+            normalize_number(e.split(":")[0]) == number
+            for e in config.SIP_KNOWN_CALLERS.split(",") if ":" in e):
+        return False, "номер не в списке разрешённых"
+    now = time.time()
+    fresh = [t for t in _recent_calls.get(number, []) if now - t < 3600]
+    if len(fresh) >= config.SIP_MAX_CALLS_PER_HOUR:
+        return False, f"с номера {number} за час уже {len(fresh)} звонков"
+    fresh.append(now)
+    _recent_calls[number] = fresh
+    return True, ""
+
+
 class Conversation:
     """
     Один звонок. Копит аудио от абонента, по паузе распознаёт, спрашивает
@@ -129,8 +180,10 @@ class Conversation:
         self.last_voice = time.time()
         self.started = time.time()
         self.turns = 0
+        self.role = role_for_caller(caller)
         self.request_id = logging_setup.new_request(caller or call_id, "sip")
-        log.info("звонок начат: %s от %s", call_id, caller or "неизвестного номера")
+        log.info("звонок начат: %s от %s, роль %s", call_id,
+                 caller or "неизвестного номера", self.role)
 
     # Простейший детектор тишины по громкости. Полноценный вариант —
     # Silero VAD; здесь важно не иметь тяжёлых зависимостей в базовой сборке.
@@ -170,10 +223,20 @@ class Conversation:
                      f"{len(question)} символов")
             if len(question.strip()) < 3:
                 return "", b""
+            # Ограничение частоты для линии считается по звонку, а не по
+            # сотруднику: сотрудника здесь может не быть вовсе. Без него
+            # телефонный канал не ограничен ничем — один скрипт,
+            # открывающий соединения, выжигает бюджет на модель и
+            # выкачивает базу голосом.
+            if self.turns >= config.SIP_MAX_TURNS:
+                log.warning("звонок %s превысил предел вопросов (%d)",
+                            self.call_id, config.SIP_MAX_TURNS)
+                return ("Извините, на один звонок можно задать ограниченное "
+                        "число вопросов. Перезвоните, пожалуйста, позже."), b""
             self.turns += 1
             # Человек ждёт на линии — самая срочная очередь к модели.
             res = answer_mod.ask(question, user_name=self.caller, chat_id=None,
-                                 role=config.DEFAULT_ROLE, source="голос")
+                                 role=self.role, source="голос")
             text = _shorten_for_phone(res.text)
             out = Path(tmp) / "out.ogg"
             voice.synthesize(text, out)
@@ -233,7 +296,17 @@ async def audiosocket_server() -> None:
                 if kind == AS_UUID:
                     call_id = str(uuid.UUID(bytes=payload)) if len(payload) == 16 \
                         else payload.hex()
-                    conv = Conversation(call_id, caller=str(peer))
+                    # Номер звонящего передаёт станция; при прямом
+                    # подключении к порту его нет — тогда это заведомо
+                    # не звонок, и роль будет гостевой.
+                    caller = str(peer[0]) if peer else ""
+                    ok, why = call_allowed(caller)
+                    if not ok:
+                        log.warning("звонок отклонён: %s", why)
+                        await _say(writer, "Извините, сейчас я не могу принять "
+                                           "обращение. Попробуйте позже.")
+                        break
+                    conv = Conversation(call_id, caller=caller)
                     await _say(writer, config.SIP_GREETING)
                 elif kind == AS_AUDIO and conv is not None:
                     if conv.feed(payload):

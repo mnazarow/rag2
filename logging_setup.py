@@ -90,8 +90,26 @@ class ContextFilter(logging.Filter):
         record.request_id = _request_id.get()
         record.user_id = _user_id.get()
         record.channel = _channel.get()
+        if not config.LOG_MASK_SENSITIVE:
+            return True
+        # Маскировать нужно и подставляемые значения, а не только строку
+        # формата. Раньше пряталось лишь `record.msg`, а весь код пишет
+        # `log.error("…: %s", exc)` — то есть секрет, попавший в текст
+        # исключения, ложился в журнал как есть. Так и утекал пароль АТС:
+        # он входит в адрес WebSocket, и любая ошибка подключения
+        # печатала этот адрес целиком. А журналы читает любая роль
+        # админки, включая «только смотреть».
         if isinstance(record.msg, str):
             record.msg = mask(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: (mask(str(v)) if isinstance(v, (str, BaseException))
+                                   else v)
+                               for k, v in record.args.items()}
+            else:
+                record.args = tuple(
+                    mask(str(a)) if isinstance(a, (str, BaseException)) else a
+                    for a in record.args)
         return True
 
 
@@ -183,6 +201,26 @@ class DatabaseHandler(logging.Handler):
             pass
 
 
+def _process_name() -> str:
+    """
+    Как называется журнал этого процесса.
+
+    По имени запущенного файла: webui.py → admin, bot.py → bot и так
+    далее. Если запущено что-то неизвестное — по имени файла, а в
+    крайнем случае по номеру процесса: пусть лучше будет лишний файл,
+    чем два процесса, портящие один.
+    """
+    known = {"webui": "admin", "bot": "bot", "index": "index",
+             "watcher": "watcher", "sip": "sip", "jobs": "jobs",
+             "runjob": "jobs", "backup": "backup", "ocr": "ocr",
+             "crawl": "crawl", "alerts": "alerts", "media": "media"}
+    name = Path(sys.argv[0]).stem if sys.argv and sys.argv[0] else ""
+    if name in known:
+        return known[name]
+    safe = re.sub(r"[^\w.-]", "_", name).strip("-._")
+    return safe or f"процесс-{os.getpid()}"
+
+
 def setup(force: bool = False) -> None:
     """Вызывается один раз при старте любого процесса."""
     global _configured
@@ -209,9 +247,20 @@ def setup(force: bool = False) -> None:
         if config.LOG_TO_FILE:
             log_dir = Path(config.LOG_DIR)
             log_dir.mkdir(parents=True, exist_ok=True)
+            # У каждого процесса свой файл. Ротация по размеру из
+            # нескольких процессов не работает в принципе: каждый считает
+            # размер сам и переименовывает файл, когда сочтёт нужным, а
+            # остальные продолжают писать в переименованный. Записи
+            # теряются и перемешиваются ровно тогда, когда журнал нужен
+            # для разбора аварии.
+            #
+            # Имя берём по роли процесса — admin.log, bot.log, index.log —
+            # и это заодно удобнее: искать причину в журнале одного
+            # процесса проще, чем в общей ленте четырёх.
+            who = _process_name()
             main = logging.handlers.RotatingFileHandler(
-                log_dir / "assistant.log", maxBytes=config.LOG_MAX_MB * 1024 * 1024,
-                backupCount=config.LOG_BACKUPS, encoding="utf-8")
+                log_dir / f"{who}.log", maxBytes=config.LOG_MAX_MB * 1024 * 1024,
+                backupCount=config.LOG_BACKUPS, encoding="utf-8", delay=True)
             main.setLevel(getattr(logging, config.LOG_LEVEL_FILE, logging.DEBUG)
                           if config.LOG_LEVEL_FILE != "TRACE" else TRACE)
             main.setFormatter(JsonFormatter() if json_mode else HumanFormatter())
@@ -219,8 +268,9 @@ def setup(force: bool = False) -> None:
             root.addHandler(main)
 
             errors = logging.handlers.RotatingFileHandler(
-                log_dir / "errors.log", maxBytes=config.LOG_MAX_MB * 1024 * 1024,
-                backupCount=config.LOG_BACKUPS, encoding="utf-8")
+                log_dir / f"{who}-errors.log",
+                maxBytes=config.LOG_MAX_MB * 1024 * 1024,
+                backupCount=config.LOG_BACKUPS, encoding="utf-8", delay=True)
             errors.setLevel(logging.WARNING)
             errors.setFormatter(JsonFormatter() if json_mode else HumanFormatter())
             errors.addFilter(ctx)
@@ -318,20 +368,43 @@ def set_level(subsystem: str, level: str) -> None:
     logging.getLogger(f"kb.{subsystem}").setLevel(value)
 
 
-def tail(lines: int = 200, level: str | None = None, subsystem: str | None = None) -> list[str]:
-    """Последние строки журнала — для показа в админке."""
-    path = Path(config.LOG_DIR) / "assistant.log"
-    if not path.exists():
+def log_files() -> list[Path]:
+    """Журналы всех процессов, свежие первыми."""
+    directory = Path(config.LOG_DIR)
+    if not directory.exists():
         return []
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, 2)
-            size = fh.tell()
-            block = min(size, lines * 400)
-            fh.seek(size - block)
-            data = fh.read().decode("utf-8", "ignore")
-    except OSError:
-        return []
+    files = [p for p in directory.glob("*.log") if not p.name.endswith("-errors.log")]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def tail(lines: int = 200, level: str | None = None, subsystem: str | None = None,
+         process: str | None = None) -> list[str]:
+    """
+    Последние строки журнала — для показа в админке.
+
+    Журнал теперь у каждого процесса свой, поэтому читаем все и сливаем
+    по времени. Строки помечаем именем процесса: без пометки лента из
+    четырёх источников читается плохо, а вопрос «кто это сделал» —
+    первый при разборе.
+    """
+    rows: list[str] = []
+    for path in log_files():
+        who = path.stem
+        if process and process != who:
+            continue
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                block = min(size, lines * 400)
+                fh.seek(size - block)
+                chunk = fh.read().decode("utf-8", "ignore")
+        except OSError:
+            continue
+        for line in chunk.splitlines()[-lines * 2:]:
+            rows.append(f"{line[:8]} {who:<7}{line[8:]}" if len(line) > 8 else line)
+    # Сортируем по времени в начале строки: формат одинаковый у всех.
+    data = "\n".join(sorted(rows, key=lambda x: x[:8]))
     out = data.splitlines()[-lines * 3:]
     if level:
         out = [ln for ln in out if level.upper() in ln]

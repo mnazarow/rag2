@@ -59,13 +59,27 @@ HELP = (
 )
 
 
+def _reload_dependents() -> None:
+    """Перечитать модули, зависящие от настроек, после правки .env."""
+    import importlib
+    for name in ("embeddings", "rerank", "llm", "llm_queue", "search", "security"):
+        try:
+            module = importlib.import_module(name)
+            importlib.reload(module)
+            if hasattr(module, "reset"):
+                module.reset()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("не удалось перечитать %s: %s", name, exc)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ----------------------------------------------------------- пользователи --
 # Вся работа с доступом вынесена в access.py: там же она доступна админке.
-def ensure_user(user_id: int, user_name: str | None, full_name: str | None) -> dict:
+def ensure_user(user_id: int, user_name: str | None = None,
+                full_name: str | None = None) -> dict:
     return access.ensure(user_id, user_name, full_name)
 
 
@@ -281,18 +295,58 @@ def handle_expert(user: dict, text: str) -> str:
 
 
 def handle_callback(user_id: int, data: str) -> dict:
-    """Обработка нажатий кнопок. Возвращает {alert} и опционально {send_document}."""
+    """
+    Обработка нажатий кнопок. Возвращает {alert} и опционально
+    {send_document}.
+
+    Доступ проверяется здесь заново, а не наследуется от сообщения, к
+    которому прикреплена кнопка. Причина — в устройстве Telegram: нажатие
+    кнопки это отдельный запрос с произвольным содержимым, и отправить
+    его можно любым клиентом, не видя ни кнопки, ни самого сообщения. Без
+    проверки достаточно было прислать `doc:1`, `doc:2`, … чтобы выкачать
+    из базы любой документ, включая закрытые для этой роли разделы, — и
+    это работало даже у заблокированного сотрудника.
+    """
+    user = ensure_user(user_id)
+    if not is_allowed(user):
+        return {"alert": "Нет доступа к базе знаний."}
+
     if data.startswith("fb:"):
-        _, verdict, query_id = data.split(":", 2)
-        answer_mod.record_feedback(int(query_id), user_id, verdict)
+        try:
+            _, verdict, raw_id = data.split(":", 2)
+            query_id = int(raw_id)
+        except ValueError:
+            return {"alert": ""}
+        # Оценку ставит только автор вопроса. Иначе посторонний накручивает
+        # обучающие пары и вызывает рассылку админам с чужим текстом.
+        owner = db.q1("SELECT user_id FROM queries WHERE id=?", (query_id,))
+        if owner is None or (owner["user_id"] is not None
+                             and owner["user_id"] != user_id):
+            return {"alert": "Эта оценка не ваша."}
+        answer_mod.record_feedback(query_id, user_id, verdict)
         if verdict == "up":
             return {"alert": "Спасибо! Учтено."}
         return {"alert": "Записал. Вопрос уйдёт эксперту на разбор.",
-                "notify_experts": int(query_id)}
+                "notify_experts": query_id}
+
     if data.startswith("doc:"):
-        doc_id = int(data.split(":", 1)[1])
-        row = db.q1("SELECT abs_path, file_name, size_bytes FROM documents WHERE id=?", (doc_id,))
+        try:
+            doc_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return {"alert": ""}
+        row = db.q1("SELECT abs_path, file_name, size_bytes, section "
+                    "FROM documents WHERE id=?", (doc_id,))
         if not row:
+            return {"alert": "Документ не найден."}
+        # Тот же фильтр разделов, что и в поиске: роль решает, какие папки
+        # человек вообще видит. Ответ одинаковый и для «нет такого
+        # документа», и для «он вам не положен» — иначе перебор номеров
+        # показывает, что лежит в закрытом разделе.
+        allowed = config.ROLE_SECTIONS.get(user.get("role") or config.DEFAULT_ROLE)
+        if allowed is not None and "*" not in allowed \
+                and (row["section"] or "") not in allowed:
+            log.warning("сотрудник %s запросил файл из недоступного раздела «%s»",
+                        user_id, row["section"])
             return {"alert": "Документ не найден."}
         size_mb = (row["size_bytes"] or 0) / 1024 / 1024
         if size_mb > config.TELEGRAM_MAX_DOC_MB:
@@ -375,11 +429,20 @@ class SimpleBot:
         if not me.get("ok"):
             raise SystemExit(f"Не удалось подключиться к Telegram: {me}")
         print(f"Бот запущен: @{me['result']['username']}")
-        while True:
+        import shutdown
+        while not shutdown.stopping():
+            # Настройки правят в админке, а бот — отдельный процесс.
+            # Дешёвая проверка (один stat файла) на каждом обороте: иначе
+            # изменённый порог отказа или сменённый провайдер модели
+            # доходят до бота только после ручного перезапуска, и никто
+            # об этом не догадывается.
+            if config.reload_if_changed():
+                log.warning("настройки изменились — перечитал")
+                _reload_dependents()
             try:
                 upd = await self.call("getUpdates", offset=self.offset, timeout=50)
             except Exception as exc:  # noqa: BLE001
-                print("ошибка getUpdates:", exc)
+                log.warning("ошибка получения обновлений: %s", exc)
                 await asyncio.sleep(3)
                 continue
             for u in upd.get("result", []):
@@ -528,9 +591,20 @@ async def run_aiogram(token: str) -> None:
 
 
 def main() -> None:
-    if not config.TELEGRAM_BOT_TOKEN:
-        raise SystemExit("Не задан TELEGRAM_BOT_TOKEN в .env")
+    import logging_setup as ls
+    import preflight
+    import shutdown
+
+    ls.setup()
     db.init()
+    report = preflight.check("бот")
+    print("Проверка перед запуском:")
+    print(preflight.render(report))
+    if report["fatal"]:
+        log.error("бот не запущен: %s", "; ".join(report["fatal"]))
+        raise SystemExit(2)
+    shutdown.install("бот")
+
     try:
         import aiogram  # noqa: F401
         asyncio.run(run_aiogram(config.TELEGRAM_BOT_TOKEN))
@@ -538,6 +612,9 @@ def main() -> None:
         print("aiogram не установлен — запускаю встроенный поллер "
               "(для продакшена: pip install aiogram)")
         asyncio.run(SimpleBot(config.TELEGRAM_BOT_TOKEN).run())
+    except KeyboardInterrupt:
+        pass
+    log.warning("бот остановлен")
 
 
 if __name__ == "__main__":

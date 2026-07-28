@@ -64,6 +64,42 @@ def _stamp() -> str:
     return _now().strftime("%Y%m%d-%H%M%S")
 
 
+def workdir(prefix: str) -> Path:
+    """
+    Временная папка для распаковки — рядом с данными, а не в /tmp.
+
+    Две причины. Первая: убитый посреди работы процесс не успевает
+    выполнить очистку, и в /tmp остаётся полная распакованная копия
+    индекса — несколько таких, и на диске кончается место, причём
+    незаметно. Держа их в своей папке, мы можем прибрать за собой при
+    следующем запуске. Вторая: /tmp часто отдельный и маленький раздел,
+    а копия индекса — гигабайты.
+    """
+    base = Path(config.DATA_DIR) / "work"
+    base.mkdir(parents=True, exist_ok=True)
+    cleanup_workdirs(base)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+
+
+def cleanup_workdirs(base: Path | None = None, older_than_hours: float = 6.0) -> int:
+    """Прибирает то, что осталось от прерванных операций."""
+    base = base or (Path(config.DATA_DIR) / "work")
+    if not base.exists():
+        return 0
+    removed = 0
+    cutoff = time.time() - older_than_hours * 3600
+    for item in base.iterdir():
+        try:
+            if item.stat().st_mtime < cutoff:
+                shutil.rmtree(item, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        log.warning("убрано временных папок от прерванных операций: %d", removed)
+    return removed
+
+
 def _human(size: float) -> str:
     for unit in ("Б", "КБ", "МБ", "ГБ"):
         if size < 1024 or unit == "ГБ":
@@ -117,7 +153,7 @@ def create(verify: bool | None = None, note: str = "",
     config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
     stamp = _stamp()
-    work = Path(tempfile.mkdtemp(prefix="kb_backup_"))
+    work = workdir("kb_backup_")
     started = time.time()
     try:
         say(f"Снимаю копию индекса ({config.DATA_DIR})…")
@@ -154,9 +190,21 @@ def create(verify: bool | None = None, note: str = "",
         archive = config.BACKUP_DIR / f"index-{stamp}{suffix}"
         say(f"Упаковываю в {archive.name}…")
         mode = "w:gz" if config.BACKUP_COMPRESS else "w"
-        with tarfile.open(archive, mode) as tar:
-            for item in sorted(work.iterdir()):
-                tar.add(item, arcname=item.name)
+        # Пишем во временное имя и переименовываем в конце. Иначе
+        # остановка посреди упаковки многогигабайтного архива оставляет
+        # обрезанный файл с правильным именем и свежей датой: список
+        # копий показывает его как «последняя копия, возраст два часа»,
+        # мониторинг зелёный, правило хранения удаляет ради него
+        # предыдущую нормальную. Обнаруживается в день, когда копия
+        # понадобится.
+        partial = archive.with_suffix(archive.suffix + ".partial")
+        try:
+            with tarfile.open(partial, mode) as tar:
+                for item in sorted(work.iterdir()):
+                    tar.add(item, arcname=item.name)
+            partial.replace(archive)
+        finally:
+            partial.unlink(missing_ok=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -204,7 +252,7 @@ def verify_archive(archive: Path) -> dict:
     if not archive.exists():
         report["error"] = "файл копии не найден"
         return report
-    work = Path(tempfile.mkdtemp(prefix="kb_verify_"))
+    work = workdir("kb_verify_")
     try:
         with tarfile.open(archive) as tar:
             _safe_extract(tar, work)
@@ -295,7 +343,7 @@ def restore(archive: Path, force: bool = False) -> dict:
             shutil.move(str(src), str(aside / name))
             moved.append(name)
 
-    work = Path(tempfile.mkdtemp(prefix="kb_restore_"))
+    work = workdir("kb_restore_")
     try:
         with tarfile.open(archive) as tar:
             _safe_extract(tar, work)

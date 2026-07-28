@@ -84,11 +84,33 @@ def _recency_factor(effective_date: str | None) -> float:
     return 0.5 ** (age / max(config.RECENCY_HALF_LIFE_DAYS, 1.0))
 
 
-def _allowed_sections(role: str | None) -> set[str] | None:
+def allowed_sections(role: str | None) -> set[str] | None:
+    """
+    Какие разделы базы видит эта роль. None означает «все».
+
+    Ключевой момент — что делать с ролью, которой нет в списке. Раньше
+    она получала доступ ко всему: `ROLE_SECTIONS.get(role)` возвращал
+    None, и фильтр просто не применялся. Ошибка в опасную сторону, и
+    хватало для неё опечатки: «Sales» вместо «sales», незнакомое слово в
+    `DEFAULT_ROLE`, роль, выданная в админке с другой раскладкой.
+    Сотрудник молча получал дилерский раздел, и заметить это было нечем:
+    в журнале есть запись о том, что роль что-то отсекла, и нет записи о
+    том, что она не отсекла ничего.
+
+    Теперь наоборот: если разграничение настроено, а роль в нём не
+    описана — не показываем ничего и пишем в журнал. Пустую выдачу
+    заметят в тот же день, утечку не заметят никогда.
+    """
     if not role:
         role = config.DEFAULT_ROLE
+    if not config.ROLE_SECTIONS:          # разграничение не настроено вовсе
+        return None
     sections = config.ROLE_SECTIONS.get(role)
-    if sections is None or "*" in sections:
+    if sections is None:
+        log.error("роль «%s» не описана в ROLE_SECTIONS — выдача закрыта целиком. "
+                  "Проверьте написание роли и настройку разграничения", role)
+        return set()
+    if "*" in sections:
         return None
     return set(sections)
 
@@ -155,20 +177,40 @@ def dense_ready() -> tuple[bool, str]:
     return True, f"{len(store)} векторов по {store.dim} измерений"
 
 
-def golden_search(query: str, limit: int = 3) -> list[dict]:
-    """Выверенные экспертом ответы — отдельный канал с наивысшим приоритетом."""
+def golden_search(query: str, limit: int = 3, role: str | None = None) -> list[dict]:
+    """
+    Выверенные экспертом ответы — отдельный канал с наивысшим приоритетом.
+
+    Роль учитывается и здесь. У выверенного ответа есть список разделов,
+    к которым он относится: пусто — ответ общий и виден всем, заполнено —
+    виден только тем ролям, которым открыты все перечисленные разделы.
+    Заполняется он сам, из источников, на которые эксперт сослался: если
+    ответ собран из дилерского прайса, он и останется дилерским.
+    """
     fts = _fts_query(query)
     if not fts:
         return []
     try:
-        rows = db.q("""SELECT g.id, g.question, g.answer, g.source_refs,
+        rows = db.q("""SELECT g.id, g.question, g.answer, g.source_refs, g.sections,
                               bm25(golden_fts) AS rank
                        FROM golden_fts JOIN golden_qa g ON g.id = golden_fts.rowid
                        WHERE golden_fts MATCH ? AND g.active=1
-                       ORDER BY rank LIMIT ?""", (fts, limit))
+                       ORDER BY rank LIMIT ?""", (fts, limit * 3))
     except Exception:  # noqa: BLE001
         return []
-    return [dict(r) for r in rows]
+    allowed = allowed_sections(role)
+    out = []
+    for r in rows:
+        item = dict(r)
+        need = {x for x in (item.get("sections") or "").split("|") if x}
+        if need and allowed is not None and not need <= allowed:
+            log.info("выверенный ответ %s скрыт от роли «%s»: разделы %s",
+                     item["id"], role, sorted(need))
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ----------------------------------------------------------------- RRF -----
@@ -203,7 +245,7 @@ def search(query: str, top_k: int | None = None, role: str | None = None,
         FROM chunks c JOIN documents d ON d.id = c.doc_id
         WHERE c.id IN ({','.join('?' * len(ids))})""", ids)
 
-    allowed = _allowed_sections(role)
+    allowed = allowed_sections(role)
     blocked_by_role = 0
     hits: list[Hit] = []
     for r in rows:

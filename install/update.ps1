@@ -57,7 +57,13 @@ print('  все модули загружаются')
 # Процессы, убитые при остановке, могли оставить занятые места в очереди
 # к модели. Само освободится по сроку, но это до пяти минут, в течение
 # которых ассистент выглядит зависшим.
+Say "Снимаю оборванные задачи"
+& "$Dir\venv\Scripts\python.exe" "$Dir\jobs.py" reap
+
 Say "Освобождаю очередь к модели"
 & "$Dir\venv\Scripts\python.exe" "$Dir\llm_queue.py" clear
+
+Say "Проверяю настройку после обновления"
+& "$Dir\venv\Scripts\python.exe" "$Dir\preflight.py"
 
 Write-Host "`nОБНОВЛЕНИЕ ЗАВЕРШЕНО. Копия: $dest" -ForegroundColor Green

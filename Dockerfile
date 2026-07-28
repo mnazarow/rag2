@@ -34,7 +34,18 @@ RUN mkdir -p /data /kb && \
 USER kb
 
 EXPOSE 8800
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8800/api/state >/dev/null || exit 1
 
+# Проверка живости идёт на /healthz — он отвечает без авторизации.
+# Раньше проверялся /api/state, и как только админку закрывали токеном,
+# контейнер навсегда становился «нездоровым»: обвязка перезапускала его
+# по кругу, каждый раз убивая посреди работы.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8800/healthz >/dev/null || exit 1
+
+# Через exec-форму и с обработчиком сигналов внутри: Python здесь
+# становится процессом номер один, а для него ядро не применяет действие
+# по умолчанию — SIGTERM просто игнорируется. Без обработчика `docker
+# stop` каждый раз ждал десять секунд и убивал процесс насмерть, в том
+# числе посреди записи индекса. Обработчик стоит в самом webui.py.
+STOPSIGNAL SIGTERM
 CMD ["python", "webui.py"]

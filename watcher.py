@@ -228,20 +228,29 @@ def run_once(reindex: bool = True) -> dict:
 def run_forever(interval: int | None = None) -> None:
     interval = interval or config.WATCH_INTERVAL_SECONDS
     log.info("слежение запущено: %s, интервал %d с", config.KB_ROOT, interval)
+    import shutdown
+    shutdown.install("слежение")
     observer = _try_watchdog()
     try:
-        while True:
+        while not shutdown.stopping():
+            if config.reload_if_changed():
+                log.warning("настройки изменились — перечитал")
+                interval = config.WATCH_INTERVAL_SECONDS
             try:
                 result = run_once()
                 log.info("проход завершён: %s", result)
             except Exception as exc:  # noqa: BLE001
                 log.exception("сбой прохода: %s", exc)
-            time.sleep(interval)
+            # Пауза, прерываемая сигналом: с обычным sleep остановка ждала
+            # бы целый интервал, и docker успевал перейти к принудительному
+            # завершению.
+            shutdown.wait(interval)
     except KeyboardInterrupt:
-        log.info("слежение остановлено")
+        pass
     finally:
         if observer:
             observer.stop()
+    log.info("слежение остановлено")
 
 
 _pending: set[str] = set()

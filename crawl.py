@@ -31,6 +31,8 @@ import argparse
 import json
 import re
 import sys
+import ipaddress
+import socket
 import time
 import urllib.parse
 import urllib.robotparser
@@ -66,11 +68,88 @@ def ensure_tables() -> None:
 
 
 # ------------------------------------------------------------- загрузка -----
+# ────────────────────── куда обходчику ходить нельзя ──────────────────────
+# Адреса, ведущие внутрь периметра. Обходчик ходит по ссылкам с чужих
+# сайтов и по чужим картам сайта, поэтому цель для него выбираем не мы:
+# достаточно, чтобы сайт производителя оказался взломан или просто
+# поставил в sitemap ссылку на 169.254.169.254 или на 10.0.0.5:8080 — и
+# наш собственный сервер сходит во внутреннюю сеть и положит ответ в
+# базу знаний. Проверять нужно и до запроса, и после каждого перенаправления:
+# внешний адрес легко перенаправляет на внутренний.
+_BLOCKED_NETS = [
+    ipaddress.ip_network(n) for n in (
+        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "169.254.0.0/16",       # облачные метаданные — самая частая цель
+        "0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15",
+        "::1/128", "fc00::/7", "fe80::/10",
+    )
+]
+
+
+class Blocked(RuntimeError):
+    """Адрес ведёт внутрь периметра — не ходим."""
+
+
+def address_allowed(url: str) -> tuple[bool, str]:
+    """Можно ли обращаться по этому адресу."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:
+        return False, f"неразборчивый адрес: {exc}"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"схема «{parsed.scheme}» не поддерживается"
+    host = parsed.hostname or ""
+    if not host:
+        return False, "адрес без имени узла"
+    if config.CRAWL_ALLOW_PRIVATE:
+        return True, ""
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or
+                                   (443 if parsed.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        return False, f"имя не разрешается: {exc}"
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if any(addr in net for net in _BLOCKED_NETS):
+            return False, (f"{host} ведёт на внутренний адрес {addr} — "
+                           "обход остановлен")
+    return True, ""
+
+
+def _guard(url: str) -> None:
+    ok, why = address_allowed(url)
+    if not ok:
+        log.warning("обход отклонён: %s (%s)", url, why)
+        raise Blocked(why)
+
+
 def _client():
     import httpx
-    return httpx.Client(timeout=45, follow_redirects=True,
+    # Перенаправления не следуем автоматически: каждый шаг нужно проверить
+    # отдельно, иначе внешняя ссылка одним редиректом уводит внутрь сети.
+    return httpx.Client(timeout=45, follow_redirects=False,
                         proxy=config.CRAWLER_PROXY or None,
                         headers={"User-Agent": config.CRAWL_USER_AGENT})
+
+
+def _get(client, url: str, headers: dict | None = None, hops: int = 5):
+    """GET с проверкой каждого перенаправления."""
+    seen = set()
+    for _ in range(hops):
+        _guard(url)
+        if url in seen:
+            raise Blocked("перенаправления зациклились")
+        seen.add(url)
+        r = client.get(url, headers=headers or {})
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+            url = urllib.parse.urljoin(url, r.headers["location"])
+            continue
+        return r
+    raise Blocked(f"слишком много перенаправлений: {url}")
 
 
 def fetch(url: str, etag: str | None = None, last_modified: str | None = None):
@@ -83,7 +162,7 @@ def fetch(url: str, etag: str | None = None, last_modified: str | None = None):
     if config.CRAWL_RENDER_JS:
         return _fetch_rendered(url)
     with _client() as client:
-        r = client.get(url, headers=headers)
+        r = _get(client, url, headers)
         if r.status_code == 304:
             return None, 304, etag, last_modified
         return r.text, r.status_code, r.headers.get("etag"), r.headers.get("last-modified")
@@ -155,7 +234,7 @@ def sitemap_urls(root: str) -> list[str]:
     for candidate in ("/sitemap.xml", "/sitemap_index.xml"):
         try:
             with _client() as client:
-                r = client.get(urllib.parse.urljoin(root, candidate))
+                r = _get(client, urllib.parse.urljoin(root, candidate))
             if r.status_code != 200:
                 continue
             out += re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", r.text)

@@ -32,6 +32,10 @@ class Isolated(unittest.TestCase):
         importlib.reload(config)
         importlib.reload(db)
         self.config, self.db = config, db
+        # Флаг остановки глобальный на процесс: без сброса тест, который
+        # его поднял, выключает индексацию во всех последующих.
+        import shutdown
+        shutdown.reset()
         db.init()
 
     def tearDown(self) -> None:

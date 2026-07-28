@@ -444,10 +444,19 @@ class LSAModel:
 
     # ---------------------------------------------------------- сохранение --
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, idf=self.idf, components=self.components,
-                            terms=np.array(list(self.vocab.keys()), dtype=object),
-                            meta=json.dumps(self.meta, ensure_ascii=False))
+        """
+        Сохраняет модель поиска.
+
+        Через временный файл и переименование. Модель обучается часами и
+        существует в единственном экземпляре: остановка процесса посреди
+        записи уничтожала её целиком, а система после этого просто тихо
+        переходила на поиск по точным словам.
+        """
+        import db
+        db.atomic_write(Path(path), lambda fh: np.savez_compressed(
+            fh, idf=self.idf, components=self.components,
+            terms=np.array(list(self.vocab.keys()), dtype=object),
+            meta=json.dumps(self.meta, ensure_ascii=False)))
 
     @classmethod
     def load(cls, path: Path) -> "LSAModel":

@@ -199,19 +199,43 @@ def looks_like_price_question(text: str) -> bool:
     return bool(PRICE_QUESTION_RX.search(text))
 
 
-def search_products(query: str, limit: int = 10, only_current: bool = True) -> list[dict]:
-    """Точный поиск по артикулу + полнотекстовый по наименованию."""
+def search_products(query: str, limit: int = 10, only_current: bool = True,
+                    role: str | None = None) -> list[dict]:
+    """
+    Точный поиск по артикулу + полнотекстовый по наименованию.
+
+    Роль учитывается обязательно, и это не формальность. Цены — самое
+    закрытое, что есть в базе: дилерский прайс не должен попадать
+    рознице. Раньше этот канал роль не смотрел вовсе, а поскольку цены
+    подставляются в ответ отдельным блоком с пометкой «точные данные,
+    приоритет над остальным», проверка ответа на утечку их тоже не
+    видела — она смотрела только на найденные фрагменты документов.
+    Получалось, что весь контур разграничения обходился вопросом
+    «сколько стоит артикул такой-то».
+    """
     results: list[dict] = []
     seen: set[int] = set()
     where_current = "AND p.is_current=1" if only_current else ""
 
+    # Фильтр разделов берём тот же самый, что и у поиска по документам —
+    # намеренно один код на оба канала, чтобы правила не разошлись.
+    import search as search_mod
+    allowed = search_mod.allowed_sections(role)
+    section_sql, section_args = "", []
+    if allowed is not None:
+        if not allowed:
+            return []                    # роль не описана — не показываем ничего
+        section_args = sorted(allowed)
+        section_sql = f"AND d.section IN ({','.join('?' * len(section_args))})"
+
     articles = ARTICLE_RX.findall(query) + BARE_ARTICLE_RX.findall(query)
     for art in articles:
         for row in db.q(
-            f"""SELECT p.*, d.rel_path, d.file_name FROM products p
+            f"""SELECT p.*, d.rel_path, d.file_name, d.section FROM products p
                 JOIN documents d ON d.id=p.doc_id
-                WHERE p.article = ? COLLATE NOCASE {where_current} LIMIT ?""",
-                (art, limit)):
+                WHERE p.article = ? COLLATE NOCASE {where_current} {section_sql}
+                LIMIT ?""",
+                (art, *section_args, limit)):
             if row["id"] not in seen:
                 seen.add(row["id"])
                 results.append(dict(row))
@@ -223,13 +247,14 @@ def search_products(query: str, limit: int = 10, only_current: bool = True) -> l
         fts_query = " OR ".join(f'"{t}"' for t in terms[:8])
         try:
             for row in db.q(
-                f"""SELECT p.*, d.rel_path, d.file_name,
+                f"""SELECT p.*, d.rel_path, d.file_name, d.section,
                            bm25(products_fts) AS rank
                     FROM products_fts
                     JOIN products p ON p.id = products_fts.rowid
                     JOIN documents d ON d.id = p.doc_id
-                    WHERE products_fts MATCH ? {where_current}
-                    ORDER BY rank LIMIT ?""", (fts_query, limit * 2)):
+                    WHERE products_fts MATCH ? {where_current} {section_sql}
+                    ORDER BY rank LIMIT ?""",
+                    (fts_query, *section_args, limit * 2)):
                 if row["id"] not in seen:
                     seen.add(row["id"])
                     results.append(dict(row))
