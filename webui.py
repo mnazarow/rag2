@@ -671,6 +671,7 @@ svg{display:block;width:100%}
  <button data-t="models">Модели</button>
  <button data-t="kb">База знаний</button>
  <button data-t="search">Качество поиска</button>
+ <button data-t="eval">Контрольные вопросы</button>
  <button data-t="ocr">Сканы</button>
  <button data-t="backup">Копии</button>
  <button data-t="graph">Граф</button>
@@ -937,6 +938,63 @@ svg{display:block;width:100%}
 </section>
 
 <!-- ═══════════════════════════════════════ сканы ════════════════════════ -->
+<section id="eval">
+  <h2>Контрольные вопросы</h2>
+  <p class="muted">Единственный честный способ узнать, стал ли ассистент точнее, —
+    прогнать один и тот же набор вопросов до и после изменения. Здесь этот набор
+    собирается. Рабочий объём — 150–200 вопросов; лучший источник — реальные
+    вопросы сотрудников из журнала ниже. К каждому вопросу укажите, где лежит
+    ответ (часть пути с брендом и моделью) и какая цифра должна прозвучать.
+    Особо ценны «пары-двойники»: вопрос про модель X с запретом цифр соседней
+    модели Y — только они ловят уверенный ответ про другой товар.</p>
+  <div class="panel" id="evPanel">Загружаю…</div>
+  <div class="panel" id="evProblems" style="display:none"></div>
+
+  <h2 id="evFormTitle">Добавить вопрос</h2>
+  <div class="panel">
+    <div class="toolbar">
+      <input id="evQ" placeholder="вопрос — как его задал бы сотрудник" style="width:640px">
+    </div>
+    <div class="toolbar">
+      <input id="evEF" placeholder="где ответ: часть пути, напр. ДЖИЛЕКС/4ПАСПОРТ/Водомет 55" style="width:315px"
+             title="expect_files — документ, который должен найтись (через запятую можно несколько)">
+      <input id="evET" placeholder="ожидаемые цифры в ответе: 75, 3.6" style="width:315px"
+             title="expect_text — подстроки, которые обязаны быть в ответе">
+    </div>
+    <div class="toolbar">
+      <input id="evRF" placeholder="подмена: путь двойника, напр. Водомет 60" style="width:315px"
+             title="reject_files — документ, который считается ПОДМЕНОЙ, если стоит выше нужного">
+      <input id="evRT" placeholder="запрещено в ответе: 92, 60/92" style="width:315px"
+             title="reject_text — подстроки, которых в ответе быть не должно">
+    </div>
+    <div class="toolbar">
+      <button class="act" onclick="evSave()">Сохранить вопрос</button>
+      <button class="act sec" onclick="evClear()">Очистить форму</button>
+      <span class="muted" id="evFormNote"></span>
+    </div>
+  </div>
+
+  <h2>Кандидаты из журнала</h2>
+  <p class="muted">Вопросы, которые сотрудники уже задавали — в первую очередь те,
+    на которые бот не ответил. Нажмите «в набор», укажите, где лежит ответ,
+    и сохраните.</p>
+  <div id="evCandidates" class="panel">—</div>
+
+  <h2>Набор <span id="evCount"></span></h2>
+  <div id="evList">Загружаю…</div>
+
+  <h2>Замер</h2>
+  <div class="toolbar">
+    <button class="act" onclick="job('regression',{reason:'вручную из раздела'})">Прогнать поиск</button>
+    <button class="act sec" onclick="job('eval_llm')">Прогнать с генерацией (долго)</button>
+  </div>
+  <p class="muted">«Прогнать поиск» — быстрый замер: находятся ли нужные документы
+    (hit, MRR) и нет ли подмен. «С генерацией» дополнительно проверяет сами
+    ответы: есть ли ожидаемые цифры и нет ли запрещённых. Результат — в разделе
+    «Конвейер»; история поисковых замеров со слепком настроек — ниже.</p>
+  <div id="evRuns">—</div>
+</section>
+
 <section id="ocr">
   <h2>Распознавание сканов</h2>
   <p class="muted">Сертификаты и декларации почти всегда лежат сканами — картинками
@@ -1355,6 +1413,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.t === 'queries') { loadQueries(); loadTraces(); }
   if (b.dataset.t === 'kb') loadKb();
   if (b.dataset.t === 'search') loadSearch();
+  if (b.dataset.t === 'eval') loadEval();
   if (b.dataset.t === 'ocr') loadOcr();
   if (b.dataset.t === 'backup') loadBackup();
   if (b.dataset.t === 'analytics') loadAnalytics();
@@ -1626,6 +1685,91 @@ async function loadKbHint(){
 }
 
 /* ------------------------------- качество поиска -------------------------- */
+/* ------------------------------- контрольные вопросы --------------------- */
+let EV_ITEMS = [];
+async function loadEval(){
+  const st=await (await fetch('/api/eval')).json();
+  EV_ITEMS = st.items||[];
+  const pct=Math.min(100, Math.round(100*st.count/st.target));
+  const bar=`<div style="background:#2a2f3a;border-radius:6px;height:10px;width:320px;display:inline-block;vertical-align:middle">
+    <div style="background:${st.count>=st.target?'#3fb950':'#d29922'};height:10px;border-radius:6px;width:${pct}%"></div></div>`;
+  $('evPanel').innerHTML =
+    `<b>${st.count}</b> из ${st.target} вопросов ${bar}<br>
+     <span class="muted">с проверкой цифр ответа: ${st.with_text} · пар-двойников: ${st.with_twins}
+     · файл: <code>${esc(st.path)}</code></span>`;
+  const pr=$('evProblems');
+  if ((st.problems||[]).length){
+    pr.style.display='';
+    pr.innerHTML='<b>Слабости набора</b> <span class="muted">— метрика не лучше своих эталонов</span><ul style="margin:6px 0 0 18px">'
+      + st.problems.map(x=>`<li>${esc(x)}</li>`).join('')+'</ul>';
+  } else { pr.style.display='none'; }
+  $('evCount').textContent = st.count ? `(${st.count})` : '';
+  $('evCandidates').innerHTML = (st.candidates||[]).length
+    ? '<table><tr><th>вопрос</th><th>задавали</th><th>ответ был</th><th></th></tr>'
+      + st.candidates.map(c=>`<tr><td>${esc(c.question)}</td><td>${c.asked}</td>
+        <td>${c.answered?'да':'<b style="color:#f85149">нет</b>'}</td>
+        <td><button class="act sec" onclick="evUse(this.dataset.q)" data-q="${esc(c.question)}">в набор</button></td></tr>`).join('')
+      + '</table>'
+    : '<span class="muted">Журнал пока пуст — кандидаты появятся после первых вопросов сотрудников.</span>';
+  $('evList').innerHTML = EV_ITEMS.length
+    ? '<table><tr><th>№</th><th>вопрос</th><th>где ответ</th><th>ожидается</th><th>запрещено</th><th></th></tr>'
+      + EV_ITEMS.map((it,i)=>`<tr><td>${i+1}</td><td>${esc(it.question)}</td>
+        <td class="muted">${esc((it.expect_files||[]).join(', '))}</td>
+        <td class="muted">${esc((it.expect_text||[]).join(', '))}</td>
+        <td class="muted">${esc([...(it.reject_files||[]),...(it.reject_text||[])].join(', '))}</td>
+        <td style="white-space:nowrap">
+          <button class="act sec" onclick="evEdit(${i})" title="править">✎</button>
+          <button class="act sec" onclick="evTwin(${i})" title="создать вопрос-двойник">⧉</button>
+          <button class="act sec" onclick="evDel(${i})" title="удалить">✕</button></td></tr>`).join('')
+      + '</table>'
+    : '<span class="muted">Набор пуст.</span>';
+  $('evRuns').innerHTML = (st.runs||[]).length
+    ? '<table><tr><th>когда</th><th>повод</th><th>вопросов</th><th>hit</th><th>MRR</th></tr>'
+      + st.runs.map(r=>`<tr><td>${esc((r.created_at||'').replace('T',' ').slice(0,16))}</td>
+        <td>${esc(r.reason)}</td><td>${r.questions}</td><td>${r.hit}</td><td>${r.mrr}</td></tr>`).join('')
+      + '</table>'
+    : '<span class="muted">Замеров ещё не было.</span>';
+}
+function evFill(it, idx){
+  $('evQ').value = it.question||'';
+  $('evEF').value = (it.expect_files||[]).join(', ');
+  $('evET').value = (it.expect_text||[]).join(', ');
+  $('evRF').value = (it.reject_files||[]).join(', ');
+  $('evRT').value = (it.reject_text||[]).join(', ');
+  $('evQ').dataset.index = idx===undefined?'':idx;
+  $('evFormTitle').textContent = idx===undefined?'Добавить вопрос':`Править вопрос №${idx+1}`;
+  $('evQ').scrollIntoView({behavior:'smooth',block:'center'});
+}
+function evClear(){ evFill({}, undefined); $('evFormTitle').textContent='Добавить вопрос'; $('evFormNote').textContent=''; }
+function evEdit(i){ evFill(EV_ITEMS[i], i); }
+function evUse(q){ evFill({question:q}, undefined);
+  $('evFormNote').textContent='укажите, где лежит ответ, и сохраните'; }
+function evTwin(i){
+  const it=EV_ITEMS[i], rx=/\d+(?:[.,]\d+)?(?:[\/\-]\d+(?:[.,]\d+)?)+/g;
+  const sigs=(it.question.match(rx))||[];
+  evFill({question: it.question.replace(rx,'«МОДЕЛЬ-СОСЕД»'),
+          reject_files: it.expect_files||[],
+          reject_text: [...(it.expect_text||[]), ...sigs]}, undefined);
+  $('evFormNote').textContent='замените «МОДЕЛЬ-СОСЕД» на соседнюю модель и укажите её ожидания';
+}
+async function evSave(){
+  const idx=$('evQ').dataset.index;
+  const body={item:{question:$('evQ').value, expect_files:$('evEF').value,
+    expect_text:$('evET').value, reject_files:$('evRF').value, reject_text:$('evRT').value}};
+  if (idx!=='' && idx!==undefined) body.index=parseInt(idx);
+  const r=await (await fetch('/api/eval/save',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if (r.error){ $('evFormNote').textContent=r.error; return; }
+  evClear(); loadEval();
+}
+async function evDel(i){
+  if (!confirm('Удалить вопрос №'+(i+1)+'?')) return;
+  const r=await (await fetch('/api/eval/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})})).json();
+  if (r.error) alert(r.error);
+  loadEval();
+}
+
 async function loadSearch(){
   const m=await (await fetch('/api/maintenance')).json();
   const e=m.embeddings, r=m.rerank, st=r.stats||{};
@@ -3040,6 +3184,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/quickstart":
             import quickstart
             return self._json(quickstart.state())
+        if path == "/api/eval":
+            import evalpanel
+            return self._json(evalpanel.state())
 
         if path == "/api/schedule":
             import schedule as schedule_mod
@@ -3659,6 +3806,7 @@ class Handler(BaseHTTPRequestHandler):
                 "structure": "сверка структуры папок",
                 "compare": "сравнение настроек поиска",
                 "regression": "проверка качества на контрольных вопросах",
+                "eval_llm": "полный замер с генерацией ответов",
                 "crawl": "обход сайтов производителей",
                 "media": "расшифровка видео и аудио",
                 "contextual": "контекстные приставки через модель",
@@ -3815,6 +3963,28 @@ class Handler(BaseHTTPRequestHandler):
                                               f"дубликатов {s['dupes']}"})
             except Exception as exc:  # noqa: BLE001
                 return self._json({"message": safe_error(exc)}, 500)
+
+        if path == "/api/eval/save":
+            import evalpanel
+            index = payload.get("index")
+            try:
+                result = evalpanel.save_item(payload.get("item") or {},
+                                             int(index) if index is not None else None)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            log.warning("контрольный вопрос сохранён (%s): %s",
+                        "правка" if index is not None else "новый",
+                        result["item"]["question"][:80])
+            return self._json({"message": f"Сохранено, в наборе {result['count']}."})
+
+        if path == "/api/eval/delete":
+            import evalpanel
+            try:
+                result = evalpanel.delete_item(int(payload.get("index", -1)))
+            except (ValueError, TypeError) as exc:
+                return self._json({"error": str(exc)}, 400)
+            log.warning("контрольный вопрос удалён: %s", result["removed"][:80])
+            return self._json({"message": f"Удалено, осталось {result['count']}."})
 
         if path == "/api/golden":
             import answer as answer_mod

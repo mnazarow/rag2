@@ -168,6 +168,32 @@ def _compare(payload: dict, progress) -> dict:
     return eval_mod.compare(eval_mod.load(dataset), config.SEARCH_TOP_K, progress=progress)
 
 
+@jobs.handler("eval_llm")
+def _eval_llm(payload: dict, progress) -> dict:
+    """
+    Полный замер: не только «нашёлся ли документ», но и сам ответ —
+    есть ли в нём ожидаемые цифры и нет ли запрещённых (подмена соседней
+    моделью). Долгий: по обращению к модели на каждый вопрос, поэтому
+    очередь пропускает вперёд живые вопросы сотрудников.
+    """
+    import evaluate as eval_mod
+    dataset = Path(payload.get("dataset") or "eval/golden.jsonl")
+    if not dataset.exists():
+        raise jobs.JobError(f"нет файла {dataset} — соберите набор контрольных вопросов")
+    data = eval_mod.load(dataset)
+    progress(f"Прогоняю {len(data)} вопросов с генерацией — это долго")
+    result = eval_mod.evaluate(data, config.SEARCH_TOP_K, run_llm=True)
+    details = result.pop("details", [])
+    result["misses"] = [d["question"] for d in details if d["rank"] is None][:20]
+    result["substituted_questions"] = [
+        {"question": d["question"], "by": d.get("substituted_by")}
+        for d in details if d.get("substituted_by")][:20]
+    result["forbidden"] = [
+        {"question": d["question"], "found": d.get("forbidden_in_answer")}
+        for d in details if d.get("forbidden_in_answer")][:20]
+    return result
+
+
 @jobs.handler("regression")
 def _regression(payload: dict, progress) -> dict:
     import regression

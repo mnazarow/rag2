@@ -425,7 +425,7 @@ def may(role: str, method: str, path: str, payload: dict | None = None) -> bool:
             return kind not in ADMIN_ONLY_JOBS
         return any(path.startswith(p) for p in
                    ("/api/backup/verify", "/api/llm/probe",
-                    "/api/search/test", "/api/ocr/guard"))
+                    "/api/search/test", "/api/ocr/guard", "/api/eval/"))
     return False
 
 

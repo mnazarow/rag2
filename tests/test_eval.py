@@ -75,7 +75,7 @@ class TestAudit(Isolated):
         for i, p in enumerate(paths):
             self.db.run(
                 "INSERT INTO documents (rel_path, abs_path, file_name, ext, "
-                "content_hash, section, status) VALUES (?, ?, ?, ?, ?, ?, 'indexed')",
+                "content_hash, section, status) VALUES (?, ?, ?, ?, ?, ?, 'ok')",
                 (p, "/kb/" + p, p.rsplit("/", 1)[-1], ".pdf", f"hash{i}",
                  p.split("/", 1)[0]))
 
@@ -111,6 +111,88 @@ class TestAudit(Isolated):
               "expect_files": ["vodomet 55_75"], "expect_text": ["75"],
               "reject_files": ["vodomet 60_92"], "reject_text": ["92 м"]}])
         self.assertEqual(problems, [], problems)
+
+
+class TestPanel(Isolated):
+    """Раздел админки ведёт тот же файл, что и командная строка."""
+
+    def setUp(self):
+        super().setUp()
+        import evalpanel
+        self.panel = evalpanel
+        self._orig_path = evalpanel.dataset_path
+        evalpanel.dataset_path = lambda: self.tmp / "golden.jsonl"
+
+    def tearDown(self):
+        self.panel.dataset_path = self._orig_path
+        super().tearDown()
+
+    def test_roundtrip_readable_by_evaluate(self):
+        """Сохранённое панелью читается evaluate.load без потерь."""
+        self.panel.save_item({"question": "какой напор у Водомет 60/92",
+                              "expect_files": "ДЖИЛЕКС/Водомет 60",
+                              "expect_text": "92", "reject_text": "75, 55/75"})
+        rows = evaluate.load(self.panel.dataset_path())
+        self.assertEqual(rows[0]["expect_text"], ["92"])
+        self.assertEqual(rows[0]["reject_text"], ["75", "55/75"])
+
+    def test_comments_survive_rewrite(self):
+        """Строки-инструкции в шапке файла не теряются при правках."""
+        path = self.panel.dataset_path()
+        path.write_text("// как расширять набор\n", encoding="utf-8")
+        self.panel.save_item({"question": "какая подача у Водомет 55/75",
+                              "expect_files": ["ДЖИЛЕКС"]})
+        self.assertTrue(path.read_text(encoding="utf-8")
+                        .startswith("// как расширять набор"))
+
+    def test_duplicates_rejected(self):
+        self.panel.save_item({"question": "какой напор у Водомет 60/92",
+                              "expect_files": ["x"]})
+        with self.assertRaises(ValueError):
+            self.panel.save_item({"question": "Какой напор у Водомет 60/92",
+                                  "expect_files": ["y"]})
+
+    def test_expect_files_required(self):
+        with self.assertRaises(ValueError):
+            self.panel.save_item({"question": "вопрос без указания ответа"})
+
+    def test_twin_moves_signature_to_rejects(self):
+        twin = self.panel.make_twin({"question": "какой напор у Водомет 55/75",
+                                     "expect_files": ["Водомет 55"],
+                                     "expect_text": ["75 м"]})
+        self.assertIn("55/75", twin["reject_text"])
+        self.assertIn("75 м", twin["reject_text"])
+        self.assertNotIn("55/75", twin["question"])
+
+    def test_candidates_prefer_unanswered(self):
+        for q, answered in (("как оформить возврат насоса", 0),
+                            ("какой напор у Водомет 55/75", 1)):
+            self.db.run("INSERT INTO queries (question, answered, created_at) "
+                        "VALUES (?,?,datetime('now'))", (q, answered))
+        got = self.panel.candidates()
+        self.assertTrue(got and got[0]["question"] == "как оформить возврат насоса", got)
+
+    def test_state_has_everything_the_section_needs(self):
+        st = self.panel.state()
+        for key in ("items", "count", "target", "problems", "candidates",
+                    "runs", "with_text", "with_twins", "path"):
+            self.assertIn(key, st)
+
+
+class TestPanelWiring(unittest.TestCase):
+    """Кнопки раздела ссылаются на существующие задачи и адреса."""
+
+    def test_job_kind_exists(self):
+        import handlers  # noqa: F401 — регистрация
+        import jobs
+        self.assertIn("eval_llm", jobs.HANDLERS)
+        self.assertIn("regression", jobs.HANDLERS)
+
+    def test_endpoints_wired(self):
+        src = (ROOT / "webui.py").read_text(encoding="utf-8")
+        for needle in ('"/api/eval"', '"/api/eval/save"', '"/api/eval/delete"',
+                       'data-t="eval"', "loadEval"):
+            self.assertIn(needle, src, needle)
 
 
 if __name__ == "__main__":

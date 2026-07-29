@@ -138,7 +138,7 @@ def audit(dataset: list[dict]) -> list[str]:
     """
     problems: list[str] = []
     all_paths = [r["rel_path"] for r in
-                 db.q("SELECT rel_path FROM documents WHERE status='indexed'")]
+                 db.q("SELECT rel_path FROM documents WHERE status='ok'")]
     total = max(len(all_paths), 1)
 
     seen: dict[str, int] = {}
