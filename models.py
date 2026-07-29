@@ -81,6 +81,32 @@ CATALOG: list[ModelSpec] = [
               "дообучена на русских данных, гибридный режим рассуждений. "
               "Заявлена вдвое большая экономичность против дистиллятов DeepSeek."),
     ModelSpec(
+        id="qwen3.6-35b-a3b", title="Qwen3.6 35B-A3B (MoE)",
+        repo="Qwen/Qwen3.6-35B-A3B", params="35 млрд, активны 3",
+        arch="Qwen3.6 MoE", vram_gb=20, quant="int4 (llama.cpp/ollama)",
+        context=262144, license="Apache 2.0",
+        russian="хорошее — наследует Qwen3, на своих вопросах проверьте замером",
+        engine="vllm", ollama_tag="qwen3.6:35b", recommended=True,
+        extra_args=["--max-model-len", "65536"],
+        notes="Новое поколение (апрель 2026): смесь экспертов, понимает и "
+              "изображения, родной контекст 256 тысяч токенов. Требует "
+              "vllm 0.19 и новее — на старом сервер просто не поднимется. "
+              "Официальной AWQ-квантовки пока нет, для одной карты берите "
+              "вариант из ollama. Контекст в наших параметрах ограничен "
+              "64 тысячами: полный съедает память восьми карт."),
+    ModelSpec(
+        id="qwen3.6-27b", title="Qwen3.6 27B", repo="Qwen/Qwen3.6-27B",
+        params="27 млрд", arch="Qwen3.6 (гибридное внимание)", vram_gb=18,
+        quant="int4 (llama.cpp/ollama)", context=262144, license="Apache 2.0",
+        russian="хорошее — наследует Qwen3, на своих вопросах проверьте замером",
+        engine="vllm", ollama_tag="qwen3.6:27b",
+        extra_args=["--max-model-len", "65536"],
+        notes="Плотная модель нового поколения с гибридным вниманием "
+              "(Gated DeltaNet): длинные документы обрабатывает заметно "
+              "дешевле обычной. Понимает изображения. Требует vllm 0.19 и "
+              "новее. Официальной AWQ-квантовки пока нет — для одной карты "
+              "удобнее ollama-вариант."),
+    ModelSpec(
         id="qwen3-32b", title="Qwen3 32B", repo="Qwen/Qwen3-32B-AWQ",
         params="32 млрд", arch="Qwen3", vram_gb=21, quant="AWQ int4", context=32768,
         license="Apache 2.0", russian="хорошее", engine="vllm", ollama_tag="qwen3:32b",
@@ -94,7 +120,8 @@ CATALOG: list[ModelSpec] = [
         ollama_tag="qwen3:30b-a3b", recommended=True,
         notes="Смесь экспертов: отвечает заметно быстрее плотной модели того же "
               "размера, потому что на каждый токен работает лишь часть весов. "
-              "Лучший вариант, если важна скорость ответа."),
+              "Лучший вариант, если важна скорость ответа, а обновлять vllm "
+              "до 0.19 ради Qwen3.6 пока не хочется."),
     ModelSpec(
         id="gigachat3-20b-a3b", title="GigaChat3 20B-A3B (Сбер)",
         repo="ai-sage/GigaChat3-20B-A3B-instruct", params="20 млрд, активны 3",
