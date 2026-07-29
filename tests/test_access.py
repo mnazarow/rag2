@@ -254,6 +254,80 @@ class TestLoginBruteForce(Isolated):
         self.assertTrue(self.security.login_attempt_allowed("ivanov", "10.0.0.5")["ok"])
 
 
+class TestTokenLoginPage(Isolated):
+    """
+    Вход по общему паролю — через форму, а не через голый 401.
+
+    Установщик теперь всегда задаёт ADMIN_TOKEN, то есть первое, что
+    видит человек по адресу админки, — страница входа. Раньше в
+    токен-режиме браузер получал текст «unauthorized», и единственным
+    способом войти была ссылка с токеном в адресе.
+    """
+
+    def _serve(self):
+        import http.server
+        import inspect
+        import threading
+
+        import webui
+        cls = next(obj for obj in vars(webui).values()
+                   if inspect.isclass(obj)
+                   and issubclass(obj, http.server.BaseHTTPRequestHandler)
+                   and obj is not http.server.BaseHTTPRequestHandler)
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), cls)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, srv.server_address[1]
+
+    def test_token_mode_shows_form_and_accepts_password(self):
+        import json
+        import urllib.error
+        import urllib.request
+
+        import importlib
+
+        import config
+        os_token = "test-token-123"
+        import os
+        os.environ["ADMIN_TOKEN"] = os_token
+        importlib.reload(config)
+        try:
+            srv, port = self._serve()
+
+            def req(path, body=None, cookie=None):
+                headers = {"Content-Type": "application/json"}
+                if cookie:
+                    headers["Cookie"] = cookie
+                r = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(body).encode() if body is not None else None,
+                    headers=headers)
+                try:
+                    with urllib.request.urlopen(r) as resp:
+                        return resp.status, resp.read().decode(), dict(resp.headers)
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode(), dict(e.headers)
+
+            code, html, _ = req("/")
+            self.assertEqual(code, 200)
+            self.assertIn("Пароль администратора", html)
+
+            code, _, _ = req("/api/token-login", {"token": "wrong"})
+            self.assertEqual(code, 401)
+
+            code, _, hdrs = req("/api/token-login", {"token": os_token})
+            self.assertEqual(code, 200)
+            self.assertIn("kb_token=", hdrs.get("Set-Cookie", ""))
+
+            code, html, _ = req("/", cookie=f"kb_token={os_token}")
+            self.assertEqual(code, 200)
+            self.assertIn("Быстрый старт", html)
+            srv.shutdown()
+        finally:
+            os.environ.pop("ADMIN_TOKEN", None)
+            importlib.reload(config)
+
+
 class TestLogMasking(unittest.TestCase):
     """
     Маскировался только текст сообщения, а не подставляемые значения.

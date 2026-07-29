@@ -2942,6 +2942,44 @@ async function enter(e){
 </script></body></html>"""
 
 
+TOKEN_PAGE = r"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Вход · Ассистент базы знаний</title><style>
+body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+ background:#0f1116;color:#e6e8ec;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
+form{background:#171a21;border:1px solid #262a33;border-radius:12px;padding:28px 30px;width:340px}
+h1{font-size:16px;margin:0 0 4px}
+p.sub{color:#8b93a3;font-size:13px;margin:0 0 20px}
+label{display:block;font-size:12px;color:#8b93a3;margin:14px 0 5px}
+input{width:100%;background:#0f1116;border:1px solid #2c313c;color:#e6e8ec;
+ border-radius:8px;padding:9px 11px;font-size:14px;box-sizing:border-box}
+button{width:100%;margin-top:20px;background:#2f6fb0;border:0;color:#fff;
+ border-radius:8px;padding:10px;font-size:14px;cursor:pointer}
+.err{color:#f85149;font-size:13px;margin-top:12px;min-height:18px}
+p.hint{color:#8b93a3;font-size:12px;margin:16px 0 0}
+</style></head><body>
+<form onsubmit="enter(event)">
+  <h1>Ассистент базы знаний</h1>
+  <p class="sub">Вход в администрирование</p>
+  <label>Пароль администратора</label>
+  <input id="token" type="password" autofocus autocomplete="current-password">
+  <button type="submit">Войти</button>
+  <div class="err" id="err"></div>
+  <p class="hint">Пароль создан при установке (ADMIN_TOKEN в файле .env
+  папки установки) — его печатал установщик.</p>
+</form>
+<script>
+async function enter(e){
+  e.preventDefault();
+  const r = await (await fetch('/api/token-login',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token:document.getElementById('token').value})})).json();
+  if(r.ok){ location.href='/'; }
+  else { document.getElementById('err').textContent = r.error || 'не вышло'; }
+}
+</script></body></html>"""
+
+
 # --------------------------------------------------------------- сервер -----
 class Handler(BaseHTTPRequestHandler):
     server_version = "KBAdmin/2.0"
@@ -2985,7 +3023,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         import security
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/login", "/api/login", "/healthz"):
+        if path in ("/login", "/api/login", "/api/token-login", "/healthz"):
             return True
         if security.accounts_enabled():
             account = self._account()
@@ -3160,8 +3198,13 @@ class Handler(BaseHTTPRequestHandler):
                 return None
 
         if not self._authorized():
-            if security.accounts_enabled() and path in ("/", "/index.html"):
-                return self._send(200, LOGIN_PAGE.encode(), "text/html")
+            if path in ("/", "/index.html", "/login"):
+                # Человеку — форма входа, а не голое «unauthorized»:
+                # с учётными записями своя, в токен-режиме — поле пароля.
+                if security.accounts_enabled():
+                    return self._send(200, LOGIN_PAGE.encode(), "text/html")
+                if config.ADMIN_TOKEN:
+                    return self._send(200, TOKEN_PAGE.encode(), "text/html")
             return self._send(401, b"unauthorized", "text/plain")
 
         if path in ("/", "/index.html"):
@@ -3554,6 +3597,37 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._send(401, b"unauthorized", "text/plain")
         payload = self._body()
+
+        # ------------------------------------------- вход по общему паролю --
+        if path == "/api/token-login":
+            import security
+            addr = self.client_address[0] if self.client_address else "?"
+            if not config.ADMIN_TOKEN or security.accounts_enabled():
+                return self._json({"error": "этот способ входа отключён"}, 400)
+            gate = security.login_attempt_allowed("__token__", addr)
+            if not gate["ok"]:
+                log.error("вход по паролю заблокирован после серии неудачных "
+                          "попыток с адреса %s", addr)
+                return self._json({"error": gate["message"]}, 429)
+            given = str(payload.get("token", ""))
+            if not hmac.compare_digest(given, config.ADMIN_TOKEN):
+                left = security.login_failed("__token__", addr)
+                log.warning("неверный пароль администратора с адреса %s "
+                            "(осталось попыток: %d)", addr, left)
+                time.sleep(1.0)
+                return self._json({"error": "неверный пароль"}, 401)
+            security.login_succeeded("__token__", addr)
+            body = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            secure = "; Secure" if _behind_https(self) else ""
+            self.send_header("Set-Cookie",
+                             f"kb_token={config.ADMIN_TOKEN}; Path=/; HttpOnly; "
+                             f"SameSite=Strict; Max-Age=43200{secure}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return None
 
         # --------------------------------------------------------- вход ----
         if path == "/api/login":
