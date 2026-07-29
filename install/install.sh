@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Установка ассистента базы знаний на Linux и macOS.
 #
-#   ./install.sh                     — обычная установка
+#   ./install.sh                     — обычная установка: с автозапуском и
+#                                      доступом к веб-интерфейсу из сети (с паролем)
 #   ./install.sh --docker            — через Docker Compose
-#   ./install.sh --with-gpu          — плюс библиотеки для локальных моделей
-#   ./install.sh --dir /opt/kb       — куда ставить
-#   ./install.sh --service           — зарегистрировать автозапуск
-#   ./install.sh --network           — открыть веб-интерфейс из сети (с паролем)
-#   ./install.sh --no-packages       — не ставить системные пакеты самому
-#   ./install.sh --dry-run           — показать, что будет сделано
+#   ./install.sh --with-gpu         — плюс библиотеки для локальных моделей
+#   ./install.sh --dir /opt/kb      — куда ставить
+#   ./install.sh --no-service       — БЕЗ автозапуска (запуск руками)
+#   ./install.sh --no-network       — веб-интерфейс только на этой машине
+#   ./install.sh --no-packages      — не ставить системные пакеты самому
+#   ./install.sh --dry-run          — показать, что будет сделано
 #
 # Скрипт идемпотентен: повторный запуск ничего не ломает и лишнего не ставит.
 
@@ -18,8 +19,12 @@ APP_NAME="kb-assistant"
 TARGET="${TARGET:-$HOME/$APP_NAME}"
 WITH_DOCKER=0
 WITH_GPU=0
-WITH_SERVICE=0
-WITH_NETWORK=0
+# Автозапуск и доступ из сети включены по умолчанию: систему ставят,
+# чтобы ею пользовалась компания, а не один терминал. Отказ — ключами
+# --no-service и --no-network. Наружу без пароля всё равно нельзя:
+# сетевой шаг сам генерирует ADMIN_TOKEN, если тот не задан.
+WITH_SERVICE=1
+WITH_NETWORK=1
 DRY_RUN=0
 # Ставить недостающие системные пакеты самим. Включено: строчку «а теперь
 # выполните вот эту команду» пропускают, и потом неделю выясняют, почему
@@ -55,7 +60,7 @@ HINT
 trap on_error ERR
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -63,8 +68,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --docker) WITH_DOCKER=1 ;;
     --with-gpu) WITH_GPU=1 ;;
-    --service) WITH_SERVICE=1 ;;
-    --network) WITH_NETWORK=1 ;;
+    --service) WITH_SERVICE=1 ;;              # совместимость: теперь и так по умолчанию
+    --network) WITH_NETWORK=1 ;;              # совместимость: теперь и так по умолчанию
+    --no-service) WITH_SERVICE=0 ;;
+    --no-network) WITH_NETWORK=0 ;;
     --no-packages) WITH_PACKAGES=0 ;;
     --dry-run) DRY_RUN=1 ;;
     --dir) shift; TARGET="${1:?после --dir нужен путь}" ;;
@@ -380,6 +387,15 @@ print(f'  очередь к модели: не больше {config.LLM_MAX_CONC
   ( cd "$TARGET" && "$VENV_PY" preflight.py ) || \
     warn "Проверка нашла то, что нужно исправить до запуска (см. выше)"
 fi
+if [ "$WITH_SERVICE" = 1 ] && [ "$PLATFORM" = linux ] \
+   && [ "$(id -u)" != 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  # Автозапуск теперь включён по умолчанию, а значит обязан уметь
+  # отступить: на машине без sudo это предупреждение, а не крах
+  # установки на последнем шаге.
+  warn "Нет прав на настройку автозапуска (нужен root или sudo)."
+  echo "     Запускайте вручную или повторите установку от root."
+  WITH_SERVICE=0
+fi
 if [ "$WITH_SERVICE" = 1 ]; then
   if [ "$PLATFORM" = linux ] && command -v systemctl >/dev/null 2>&1; then
     # Имя пользователя берём надёжным способом. Переменная USER в
@@ -441,7 +457,7 @@ BOTEOF"
       ok "Служба $APP_NAME-bot запущена"
     else
       warn "Токен Telegram не задан — служба бота не создана. Задайте"
-      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку с --service снова."
+      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку снова."
     fi
   elif [ "$PLATFORM" = macos ]; then
     PLIST="$HOME/Library/LaunchAgents/ru.company.$APP_NAME.plist"
@@ -482,22 +498,33 @@ BOTPLISTEOF"
       ok "Автозапуск бота настроен"
     else
       warn "Токен Telegram не задан — автозапуск бота не настроен. Задайте"
-      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку с --service снова."
+      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку снова."
     fi
   else
     warn "Автозапуск на этой системе не настроен — запускайте вручную"
   fi
 fi
 
+printf "\nУСТАНОВКА ЗАВЕРШЕНА\n\n"
+
+if [ "$WITH_SERVICE" = 1 ]; then
+  echo "Веб-интерфейс уже запущен как служба."
+else
+  echo "Автозапуск выключен (--no-service) — запускать так:"
+  echo "       $TARGET/venv/bin/python $TARGET/webui.py"
+fi
+if [ "$WITH_NETWORK" = 1 ]; then
+  echo "Открыть: с этой машины — http://127.0.0.1:8800"
+  [ -n "${LAN_IP:-}" ] && echo "         из сети        — http://$LAN_IP:8800"
+  echo "Пароль — значение ADMIN_TOKEN в $TARGET/.env"
+else
+  echo "Открыть: http://127.0.0.1:8800 (только с этой машины: --no-network)"
+fi
+
 cat <<DONE
 
-УСТАНОВКА ЗАВЕРШЕНА
-
-Самый простой путь дальше — открыть веб-интерфейс и пройти по шагам там:
-там же видно, какие из них уже сделаны.
-
-       $TARGET/venv/bin/python $TARGET/webui.py
-   и открыть http://127.0.0.1:8800 — раздел «Быстрый старт»
+Самый простой путь дальше — раздел «Быстрый старт» в веб-интерфейсе:
+там же видно, какие шаги уже сделаны.
 
 Те же шаги командами, если интерфейс недоступен:
   1. Откройте настройки и укажите путь к базе знаний:

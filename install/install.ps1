@@ -17,7 +17,14 @@
   Дополнительно поставить библиотеки для локальных моделей.
 
 .PARAMETER Service
-  Зарегистрировать автозапуск через планировщик заданий.
+  Оставлен для совместимости: автозапуск теперь включён по умолчанию.
+
+.PARAMETER NoService
+  Не регистрировать автозапуск (запуск руками).
+
+.PARAMETER NoNetwork
+  Не открывать веб-интерфейс из сети: только с этой машины.
+  По умолчанию доступ из сети включается, пароль генерируется сам.
 
 .PARAMETER DryRun
   Показать, что будет сделано, ничего не меняя.
@@ -27,7 +34,9 @@
   Список недостающих всё равно будет показан.
 
 .EXAMPLE
-  .\install.ps1 -Dir D:\KB -WithGpu -Service
+  .\install.ps1 -Dir D:\KB -WithGpu
+.EXAMPLE
+  .\install.ps1 -NoService -NoNetwork   # только этот компьютер, запуск руками
 #>
 [CmdletBinding()]
 param(
@@ -35,12 +44,18 @@ param(
   [switch]$Docker,
   [switch]$WithGpu,
   [switch]$Service,
+  [switch]$NoService,
+  [switch]$NoNetwork,
   [switch]$DryRun,
   [switch]$NoPackages
 )
 
 $ErrorActionPreference = "Stop"
 $WithPackages = -not $NoPackages
+# Автозапуск и доступ из сети — по умолчанию: систему ставят для
+# компании, а не для одного рабочего стола. Отказ: -NoService, -NoNetwork.
+$WithService = $Service -or (-not $NoService)
+$WithNetwork = -not $NoNetwork
 $script:Step = 0
 $script:Total = if ($Docker) { 5 } else { 8 }
 
@@ -202,6 +217,24 @@ Step "Готовлю настройки"
 if (-not (Test-Path "$Dir\.env")) { Run "Copy-Item '$Dir\.env.example' '$Dir\.env'"; Ok "Создан .env" }
 else { Ok ".env уже есть" }
 
+if ($WithNetwork) {
+  # Наружу без пароля нельзя: если ADMIN_TOKEN не задан, генерируем.
+  $envText = if (Test-Path "$Dir\.env") { Get-Content "$Dir\.env" -Raw } else { "" }
+  if ($envText -notmatch "(?m)^ADMIN_HOST=0\.0\.0\.0") {
+    Run "Add-Content -Path '$Dir\.env' -Value 'ADMIN_HOST=0.0.0.0'"
+  } else { Ok "Доступ из сети уже настроен" }
+  if ($envText -notmatch "(?m)^ADMIN_TOKEN=.+") {
+    $newToken = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+    Run "Add-Content -Path '$Dir\.env' -Value 'ADMIN_TOKEN=$newToken'"
+    Ok "Пароль администратора создан: $newToken — сохраните его"
+  } else { Ok "Пароль администратора уже задан (ADMIN_TOKEN в .env)" }
+  $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
+    Select-Object -First 1).IPAddress
+  if ($lanIp) { Ok "Из сети: http://${lanIp}:8800 (пароль — ADMIN_TOKEN)" }
+  Warn "Windows спросит про брандмауэр при первом запуске — разрешите."
+}
+
 Step "Проверка и автозапуск"
 if (-not $DryRun) {
   Push-Location $Dir
@@ -209,23 +242,48 @@ if (-not $DryRun) {
   & $venvPy -c "import llm_queue, config; llm_queue.ensure_tables(); print('  очередь к модели: не больше ' + str(config.LLM_MAX_CONCURRENT) + ' запросов одновременно')"
   Pop-Location
 }
-if ($Service) {
+if ($WithService) {
   Say "Регистрирую задание автозапуска"
-  $action  = New-ScheduledTaskAction -Execute $venvPy -Argument "$Dir\webui.py" -WorkingDirectory $Dir
-  $trigger = New-ScheduledTaskTrigger -AtStartup
-  $set     = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-  if (-not $DryRun) {
-    Register-ScheduledTask -TaskName "KBAssistant" -Action $action -Trigger $trigger `
-      -Settings $set -RunLevel Highest -Force | Out-Null
+  try {
+    $action  = New-ScheduledTaskAction -Execute $venvPy -Argument "$Dir\webui.py" -WorkingDirectory $Dir
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $set     = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    if (-not $DryRun) {
+      Register-ScheduledTask -TaskName "KBAssistant" -Action $action -Trigger $trigger `
+        -Settings $set -RunLevel Highest -Force | Out-Null
+    }
+    Ok "Задание KBAssistant создано"
+    $envText = if (Test-Path "$Dir\.env") { Get-Content "$Dir\.env" -Raw } else { "" }
+    if ($envText -match "(?m)^TELEGRAM_BOT_TOKEN=.+") {
+      $botAction = New-ScheduledTaskAction -Execute $venvPy -Argument "$Dir\bot.py" -WorkingDirectory $Dir
+      if (-not $DryRun) {
+        Register-ScheduledTask -TaskName "KBAssistantBot" -Action $botAction -Trigger $trigger `
+          -Settings $set -RunLevel Highest -Force | Out-Null
+      }
+      Ok "Задание KBAssistantBot создано"
+    } else {
+      Warn "Токен Telegram не задан — автозапуск бота появится после его"
+      Write-Host "     указания в .env и повторного запуска установки."
+    }
+  } catch {
+    # Автозапуск по умолчанию обязан уметь отступить: без прав
+    # администратора это предупреждение, а не крах на последнем шаге.
+    Warn "Не удалось создать автозапуск: $($_.Exception.Message)"
+    Write-Host "     Запустите PowerShell от имени администратора и повторите,"
+    Write-Host "     либо запускайте вручную: $venvPy $Dir\webui.py"
   }
-  Ok "Задание KBAssistant создано"
 }
 
 Write-Host @"
 
 УСТАНОВКА ЗАВЕРШЕНА
 
-Что дальше:
+Веб-интерфейс: http://127.0.0.1:8800 (пароль — ADMIN_TOKEN из .env).
+Если автозапуск создан, он поднимется после перезагрузки; сейчас можно
+запустить вручную: $venvPy $Dir\webui.py
+Самый простой путь дальше — раздел «Быстрый старт» в веб-интерфейсе.
+
+Те же шаги командами:
   1. Откройте настройки и укажите путь к базе знаний (KB_ROOT):
        notepad $Dir\.env
   2. Проиндексируйте базу:
