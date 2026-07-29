@@ -387,8 +387,8 @@ class TestQuickStart(unittest.TestCase):
         """
         Автозапуск и доступ из сети — по умолчанию, но с ключами отказа
         в обоих скриптах и в документации. Включённый по умолчанию
-        сетевой доступ обязан сопровождаться паролем — проверяем, что
-        генерация ADMIN_TOKEN осталась в обоих установщиках.
+        сетевой доступ обязан сопровождаться входом — проверяем, что
+        оба установщика заводят учётную запись по умолчанию.
         """
         sh = (ROOT / "install" / "install.sh").read_text(encoding="utf-8")
         ps = (ROOT / "install" / "install.ps1").read_text(encoding="utf-8")
@@ -396,10 +396,11 @@ class TestQuickStart(unittest.TestCase):
         self.assertIn("WITH_SERVICE=1\nWITH_NETWORK=1", sh)
         self.assertIn("--no-service", sh)
         self.assertIn("--no-network", sh)
-        self.assertIn("ADMIN_TOKEN", sh)
+        self.assertIn("ensure_default_admin", sh)
         self.assertIn("$WithService = $Service -or (-not $NoService)", ps)
         self.assertIn("$WithNetwork = -not $NoNetwork", ps)
-        self.assertIn("ADMIN_TOKEN", ps)
+        self.assertIn("ensure_default_admin", ps)
         self.assertIn("--no-service", doc)
         self.assertIn("--no-network", doc)
         self.assertIn("-NoService", doc)
+        self.assertIn("admin / admin", doc)

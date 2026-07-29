@@ -21,8 +21,9 @@ WITH_DOCKER=0
 WITH_GPU=0
 # Автозапуск и доступ из сети включены по умолчанию: систему ставят,
 # чтобы ею пользовалась компания, а не один терминал. Отказ — ключами
-# --no-service и --no-network. Наружу без пароля всё равно нельзя:
-# сетевой шаг сам генерирует ADMIN_TOKEN, если тот не задан.
+# --no-service и --no-network. Наружу без входа всё равно нельзя:
+# сетевой шаг заводит учётную запись admin/admin, если записей нет,
+# а проверки напоминают сменить пароль, пока он действует.
 WITH_SERVICE=1
 WITH_NETWORK=1
 DRY_RUN=0
@@ -355,24 +356,28 @@ run "chmod 600 '$TARGET/.env' 2>/dev/null || true"
 run "chmod 700 '$TARGET/data' 2>/dev/null || true"
 
 if [ "$WITH_NETWORK" = 1 ]; then
-  # Доступ из сети. Наружу без пароля нельзя — админка управляет всей
-  # системой, поэтому пароль генерируется, если его ещё нет.
+  # Доступ из сети. Наружу без входа нельзя — админка управляет всей
+  # системой, поэтому создаётся учётная запись admin/admin, если записей
+  # ещё нет. Пароль по умолчанию всем известен, поэтому проверка перед
+  # стартом и оповещения будут напоминать о нём, пока он не сменён в
+  # разделе «Безопасность».
   if grep -q "^ADMIN_HOST=0.0.0.0" "$TARGET/.env" 2>/dev/null; then
     ok "Доступ из сети уже настроен"
   else
-    run "printf '\n# Доступ из сети (добавлено установщиком по --network)\nADMIN_HOST=0.0.0.0\n' >> '$TARGET/.env'"
+    run "printf '\n# Доступ из сети (добавлено установщиком)\nADMIN_HOST=0.0.0.0\n' >> '$TARGET/.env'"
   fi
-  if ! grep -q "^ADMIN_TOKEN=." "$TARGET/.env" 2>/dev/null; then
-    NEW_TOKEN="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    run "printf 'ADMIN_TOKEN=%s\n' '$NEW_TOKEN' >> '$TARGET/.env'"
-    ok "Пароль администратора создан: $NEW_TOKEN — сохраните его"
+  if [ "$DRY_RUN" = 0 ]; then
+    ( cd "$TARGET" && "$VENV_PY" -c "
+import security
+print('  ' + security.ensure_default_admin()['message'])" ) \
+      || warn "не удалось создать учётную запись — заведите её в разделе «Безопасность»"
   else
-    ok "Пароль администратора уже задан (ADMIN_TOKEN в .env)"
+    echo "      would run: создание учётной записи admin/admin (если записей нет)"
   fi
   LAN_IP=""
   if [ "$PLATFORM" = macos ]; then LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
   else LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"; fi
-  [ -n "$LAN_IP" ] && ok "Из сети: http://$LAN_IP:8800 (пароль — ADMIN_TOKEN)"
+  [ -n "$LAN_IP" ] && ok "Из сети: http://$LAN_IP:8800"
 fi
 
 # ------------------------------------------------------------- автозапуск --
@@ -516,7 +521,7 @@ fi
 if [ "$WITH_NETWORK" = 1 ]; then
   echo "Открыть: с этой машины — http://127.0.0.1:8800"
   [ -n "${LAN_IP:-}" ] && echo "         из сети        — http://$LAN_IP:8800"
-  echo "Пароль — значение ADMIN_TOKEN в $TARGET/.env"
+  echo "Вход: admin / admin — смените пароль в разделе «Безопасность»"
 else
   echo "Открыть: http://127.0.0.1:8800 (только с этой машины: --no-network)"
 fi

@@ -75,6 +75,17 @@ def check(role: str = "процесс") -> dict:
     elif writable and free_gb < 10:
         warn.append(f"на диске с данными свободно всего {free_gb:.1f} ГБ")
 
+    # --- пароль по умолчанию ---
+    try:
+        import security
+        if security.default_password_active():
+            exposed = config.ADMIN_HOST not in ("127.0.0.1", "localhost", "::1")
+            warn.append("действует пароль по умолчанию admin/admin"
+                        + (" — и интерфейс открыт из сети" if exposed else "")
+                        + "; смените его в разделе «Безопасность»")
+    except Exception:  # noqa: BLE001
+        pass
+
     # --- копии на том же устройстве, что и данные ---
     # Отказ диска в этой конфигурации уносит и данные, и все копии разом:
     # именно то, от чего копии должны были защищать.

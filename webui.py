@@ -1344,6 +1344,14 @@ svg{display:block;width:100%}
   <table id="accounts"><thead><tr><th>Логин</th><th>Имя</th><th style="width:110px">Роль</th>
     <th style="width:150px">Создана</th><th style="width:110px"></th></tr></thead><tbody></tbody></table>
 
+  <h2>Сменить свой пароль</h2>
+  <div class="toolbar">
+    <input id="pwCur" type="password" placeholder="текущий пароль" style="width:190px">
+    <input id="pwNew" type="password" placeholder="новый, от 8 символов" style="width:190px">
+    <button class="act" onclick="changePassword()">Сменить</button>
+    <span class="muted" id="pwMsg"></span>
+  </div>
+
   <h2>Ключи и токены</h2>
   <p class="muted">Ключи выносятся из <code>.env</code> в отдельный файл с правами
     600, который не попадает ни в архив обновления, ни в резервную копию.
@@ -2332,7 +2340,11 @@ async function loadSafety(){
 
   const w=await (await fetch('/api/whoami')).json();
   $('accountsPanel').innerHTML = w.accounts
-    ? `<div>${dot(true)} Вход по учётным записям включён.
+    ? (w.default_password
+        ? `<div class="bad"><b>Действует пароль по умолчанию admin/admin.</b>
+           Он известен всем, а интерфейс может быть открыт из сети —
+           смените пароль в форме ниже.</div>` : '')
+      + `<div>${dot(true)} Вход по учётным записям включён.
         ${w.account?`Вы вошли как <b>${esc(w.account.full_name||w.account.login)}</b>
         (${esc(w.account.role)}).`:''}</div>
        <div class="muted" style="margin-top:6px">${Object.entries(w.roles||{})
@@ -2385,6 +2397,13 @@ async function addAccount(){
       full_name:$('accName').value})})).json();
   if(r.error){ alert(r.error); return; }
   $('accPass').value=''; loadSafety();
+}
+async function changePassword(){
+  const r=await (await fetch('/api/password',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({current:$('pwCur').value,new:$('pwNew').value})})).json();
+  $('pwMsg').textContent=r.message||r.error||'';
+  if(r.message){ $('pwCur').value='';$('pwNew').value=''; loadSafety(); }
 }
 async function delAccount(login){
   if(!confirm('Удалить учётную запись «'+login+'»?')) return;
@@ -3215,6 +3234,7 @@ class Handler(BaseHTTPRequestHandler):
             account = self._account()
             return self._json({
                 "accounts": security.accounts_enabled(),
+                "default_password": security.default_password_active(),
                 "account": account,
                 "role": (account or {}).get("role"),
                 "roles": security.ROLES,
@@ -3693,6 +3713,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001
                 return self._json({"error": safe_error(exc)}, 400)
             return self._json({"error": "неизвестное действие"}, 400)
+
+        if path == "/api/password":
+            import security
+            if not security.accounts_enabled():
+                return self._json({"error": "учётных записей нет"}, 400)
+            account = self._account()
+            if account is None:
+                return self._json({"error": "нужно войти"}, 401)
+            if security.check_password(account["login"],
+                                       str(payload.get("current", ""))) is None:
+                return self._json({"error": "текущий пароль неверен"}, 400)
+            try:
+                security.set_password(account["login"], str(payload.get("new", "")))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 400)
+            audit("учётная запись", f"пароль изменён: {account['login']}")
+            return self._json({"message": "Пароль изменён."})
 
         if path == "/api/secrets/move":
             import security

@@ -305,6 +305,64 @@ def accounts_enabled() -> bool:
     return bool(_read_users())
 
 
+DEFAULT_ADMIN_LOGIN = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin"
+
+
+def ensure_default_admin() -> dict:
+    """
+    Учётная запись admin/admin, если записей ещё нет.
+
+    Создаётся установщиком, чтобы вход был по имени и паролю, а не по
+    токену из файла. Пароль по умолчанию — осознанный компромисс:
+    короткий и всем известный, поэтому (а) преflight и оповещения
+    напоминают о нём, пока он действует, и (б) сменить его можно в
+    разделе «Безопасность» за десять секунд. Обычный путь add_user
+    требует восьми символов — сюда это правило не относится ровно
+    потому, что этот пароль и не должен пережить первый день.
+    """
+    users = _read_users()
+    if users:
+        return {"created": False,
+                "message": "учётные записи уже есть — ничего не меняю"}
+    salt, digest = hash_password(DEFAULT_ADMIN_PASSWORD)
+    users[DEFAULT_ADMIN_LOGIN] = {
+        "login": DEFAULT_ADMIN_LOGIN, "full_name": "Администратор",
+        "role": "admin", "salt": salt, "hash": digest, "active": True,
+        "default_password": True,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _write_users(users)
+    log.warning("создана учётная запись по умолчанию admin/admin — "
+                "смените пароль после первого входа")
+    return {"created": True,
+            "message": "Вход: admin / admin — смените пароль после первого входа"}
+
+
+def default_password_active() -> bool:
+    """Действует ли ещё пароль по умолчанию admin/admin."""
+    user = _read_users().get(DEFAULT_ADMIN_LOGIN)
+    if not user or not user.get("active"):
+        return False
+    return check_password(DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD) is not None
+
+
+def set_password(login: str, new_password: str) -> dict:
+    """Смена пароля существующей записи."""
+    if len(new_password) < 8:
+        raise ValueError("новый пароль короче восьми символов")
+    users = _read_users()
+    user = users.get((login or "").lower())
+    if not user:
+        raise ValueError("нет такой учётной записи")
+    salt, digest = hash_password(new_password)
+    user["salt"], user["hash"] = salt, digest
+    user.pop("default_password", None)
+    _write_users(users)
+    log.warning("пароль учётной записи «%s» изменён", login)
+    return {"login": user["login"]}
+
+
 # ------------------------------------------------------------- сессии -----
 _sessions: dict[str, dict] = {}
 
@@ -418,6 +476,10 @@ def may(role: str, method: str, path: str, payload: dict | None = None) -> bool:
     if role == "admin":
         return True
     if method == "GET":
+        return True
+    if path == "/api/password":
+        # Свой пароль меняет любая вошедшая роль: заставлять оператора
+        # просить администратора — верный способ, чтобы пароли не менялись.
         return True
     if role == "operator":
         if path.startswith("/api/job"):

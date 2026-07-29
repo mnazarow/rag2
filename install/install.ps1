@@ -218,20 +218,23 @@ if (-not (Test-Path "$Dir\.env")) { Run "Copy-Item '$Dir\.env.example' '$Dir\.en
 else { Ok ".env уже есть" }
 
 if ($WithNetwork) {
-  # Наружу без пароля нельзя: если ADMIN_TOKEN не задан, генерируем.
+  # Наружу без входа нельзя: заводится учётная запись admin/admin, если
+  # записей ещё нет; проверки будут напоминать сменить пароль.
   $envText = if (Test-Path "$Dir\.env") { Get-Content "$Dir\.env" -Raw } else { "" }
   if ($envText -notmatch "(?m)^ADMIN_HOST=0\.0\.0\.0") {
     Run "Add-Content -Path '$Dir\.env' -Value 'ADMIN_HOST=0.0.0.0'"
   } else { Ok "Доступ из сети уже настроен" }
-  if ($envText -notmatch "(?m)^ADMIN_TOKEN=.+") {
-    $newToken = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
-    Run "Add-Content -Path '$Dir\.env' -Value 'ADMIN_TOKEN=$newToken'"
-    Ok "Пароль администратора создан: $newToken — сохраните его"
-  } else { Ok "Пароль администратора уже задан (ADMIN_TOKEN в .env)" }
+  if (-not $DryRun) {
+    Push-Location $Dir
+    try {
+      & $venvPy -c "import security; print('  ' + security.ensure_default_admin()['message'])"
+    } catch { Warn "Не удалось создать учётную запись — заведите её в разделе «Безопасность»" }
+    Pop-Location
+  } else { Write-Host "      would run: создание учётной записи admin/admin" }
   $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
     Select-Object -First 1).IPAddress
-  if ($lanIp) { Ok "Из сети: http://${lanIp}:8800 (пароль — ADMIN_TOKEN)" }
+  if ($lanIp) { Ok "Из сети: http://${lanIp}:8800 (вход admin / admin)" }
   Warn "Windows спросит про брандмауэр при первом запуске — разрешите."
 }
 
@@ -278,7 +281,8 @@ Write-Host @"
 
 УСТАНОВКА ЗАВЕРШЕНА
 
-Веб-интерфейс: http://127.0.0.1:8800 (пароль — ADMIN_TOKEN из .env).
+Веб-интерфейс: http://127.0.0.1:8800 (вход admin / admin — смените
+пароль в разделе «Безопасность»).
 Если автозапуск создан, он поднимется после перезагрузки; сейчас можно
 запустить вручную: $venvPy $Dir\webui.py
 Самый простой путь дальше — раздел «Быстрый старт» в веб-интерфейсе.

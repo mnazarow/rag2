@@ -328,6 +328,56 @@ class TestTokenLoginPage(Isolated):
             importlib.reload(config)
 
 
+class TestDefaultAdmin(Isolated):
+    """Учётная запись по умолчанию: создаётся один раз и напоминает о себе."""
+
+    def test_created_once_and_flagged(self):
+        import importlib
+
+        import security
+        importlib.reload(security)
+        r = security.ensure_default_admin()
+        self.assertTrue(r["created"])
+        self.assertTrue(security.default_password_active())
+        self.assertIsNotNone(security.check_password("admin", "admin"))
+        r2 = security.ensure_default_admin()
+        self.assertFalse(r2["created"], "повторный вызов не должен дублировать")
+
+    def test_not_created_when_accounts_exist(self):
+        import importlib
+
+        import security
+        importlib.reload(security)
+        security.add_user("boss", "надёжный-пароль", "admin")
+        r = security.ensure_default_admin()
+        self.assertFalse(r["created"])
+        self.assertIsNone(security.check_password("admin", "admin"))
+
+    def test_password_change_clears_flag(self):
+        import importlib
+
+        import security
+        importlib.reload(security)
+        security.ensure_default_admin()
+        with self.assertRaises(ValueError):
+            security.set_password("admin", "short")
+        security.set_password("admin", "новый-длинный-пароль")
+        self.assertFalse(security.default_password_active())
+        self.assertIsNone(security.check_password("admin", "admin"))
+        self.assertIsNotNone(security.check_password("admin", "новый-длинный-пароль"))
+
+    def test_preflight_warns_about_default_password(self):
+        import importlib
+
+        import preflight
+        import security
+        importlib.reload(security)
+        security.ensure_default_admin()
+        report = preflight.check("админка")
+        self.assertTrue(any("admin/admin" in w for w in report["warn"]),
+                        report["warn"])
+
+
 class TestLogMasking(unittest.TestCase):
     """
     Маскировался только текст сообщения, а не подставляемые значения.

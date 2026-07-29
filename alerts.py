@@ -138,6 +138,18 @@ def collect() -> list[dict]:
     except Exception:  # noqa: BLE001
         pass
 
+    # Пароль по умолчанию всем известен — напоминаем, пока действует.
+    try:
+        import security
+        if security.default_password_active():
+            add("default_password", "warning",
+                "Действует пароль администратора по умолчанию",
+                "Вход admin/admin создан установщиком и известен всем, "
+                "а веб-интерфейс может быть открыт из сети.",
+                "Раздел «Безопасность» → «Сменить свой пароль».")
+    except Exception:  # noqa: BLE001
+        pass
+
     # Копии на том же диске, что и данные, не переживут его отказ.
     try:
         if not config.BACKUP_MIRROR_DIR:
