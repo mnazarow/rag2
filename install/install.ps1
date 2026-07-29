@@ -152,7 +152,8 @@ $tools = @(
   @{ Cmd = "ffmpeg";    Why = "видео и голосовые сообщения"; Pkg = "Gyan.FFmpeg" },
   @{ Cmd = "pdftotext"; Why = "разбор PDF, если не встанет PyMuPDF"; Pkg = "oschwartz10612.Poppler" },
   @{ Cmd = "git";       Why = "обновления"; Pkg = "Git.Git" },
-  @{ Cmd = "tesseract"; Why = "распознавание сканов сертификатов"; Pkg = "UB-Mannheim.TesseractOCR" }
+  @{ Cmd = "tesseract"; Why = "распознавание сканов сертификатов"; Pkg = "UB-Mannheim.TesseractOCR" },
+  @{ Cmd = "ollama";    Why = "запуск локальных моделей"; Pkg = "Ollama.Ollama" }
 )
 $missing = @()
 foreach ($t in $tools) {

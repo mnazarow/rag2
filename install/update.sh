@@ -196,6 +196,22 @@ if "$TARGET/venv/bin/python" -c "import vllm" 2>/dev/null \
     || warn "vllm не обновился (не страшно: работает прежняя версия)"
 fi
 
+# ollama: доставляем, если его ещё нет, — установка могла пройти до того,
+# как он появился в установщике. Уже стоящий не трогаем: обновление
+# сервера моделей посреди обновления кода — лишний риск без нужды.
+if ! command -v ollama >/dev/null 2>&1; then
+  say "Ставлю ollama — запуск локальных моделей"
+  if [ "$(uname -s)" = Darwin ]; then
+    command -v brew >/dev/null 2>&1 && { brew install ollama && ok "ollama установлен" \
+      || warn "ollama не поставился: brew install ollama"; } \
+      || warn "Нужен Homebrew: brew install ollama"
+  else
+    curl -fsSL https://ollama.com/install.sh | sh \
+      && ok "ollama установлен" \
+      || warn "ollama не поставился — вручную: curl -fsSL https://ollama.com/install.sh | sh"
+  fi
+fi
+
 say "Проверяю совместимость данных"
 "$TARGET/venv/bin/python" -c "
 import sys; sys.path.insert(0, '$TARGET')

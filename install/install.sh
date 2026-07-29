@@ -342,22 +342,34 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   say "Ставлю vllm — сервер локальной модели (долго, несколько гигабайт)"
   run "'$VENV_PY' -m pip install --quiet vllm" || \
     warn "vllm не поставился — повторите: $VENV_PY -m pip install vllm"
-elif [ "$PLATFORM" = macos ]; then
-  # На маке локальные модели работают через ollama на встроенной
-  # видеокарте (Metal). Ставим его, если ещё нет: без него раздел
-  # «Модели» на маке может только смотреть на каталог.
-  if command -v ollama >/dev/null 2>&1; then
-    ok "ollama уже установлен — модели пойдут на встроенной видеокарте"
-  elif command -v brew >/dev/null 2>&1 && [ "$WITH_PACKAGES" = 1 ]; then
-    say "Ставлю ollama — запуск моделей на встроенной видеокарте (Metal)"
-    run "brew install ollama" || warn "ollama не поставился: brew install ollama"
-  else
-    warn "Для локальных моделей на маке нужен ollama: brew install ollama"
-  fi
-elif [ "$WITH_GPU" = 1 ]; then
+elif [ "$WITH_GPU" = 1 ] && [ "$PLATFORM" = linux ]; then
   warn "Видеокарта NVIDIA не найдена — vllm не ставлю; локальные модели"
   echo "     будут работать очень медленно. Облачный провайдер разумнее."
 fi
+
+# ollama ставится всегда: на маке это единственный способ запускать
+# модели на встроенной видеокарте (Metal), на линуксе — простой способ
+# попробовать локальную модель без vllm. Весит немного, вреда не носит.
+install_ollama() {
+  if command -v ollama >/dev/null 2>&1; then
+    ok "ollama уже установлен"
+    return 0
+  fi
+  [ "$WITH_PACKAGES" = 1 ] || { warn "ollama не ставлю (--no-packages)"; return 0; }
+  if [ "$PLATFORM" = macos ]; then
+    if command -v brew >/dev/null 2>&1; then
+      say "Ставлю ollama — запуск моделей на встроенной видеокарте (Metal)"
+      run "brew install ollama" || warn "ollama не поставился: brew install ollama"
+    else
+      warn "Для локальных моделей на маке нужен ollama: brew install ollama"
+    fi
+  else
+    say "Ставлю ollama — простой запуск локальных моделей"
+    run "curl -fsSL https://ollama.com/install.sh | ${SUDO:-} sh" \
+      || warn "ollama не поставился — вручную: curl -fsSL https://ollama.com/install.sh | sh"
+  fi
+}
+install_ollama
 if [ "$WITH_GPU" = 1 ]; then
   say "Ставлю библиотеки для локальных моделей — это долго и займёт несколько гигабайт"
   run "'$VENV_PY' -m pip install --quiet sentence-transformers faster-whisper" || \

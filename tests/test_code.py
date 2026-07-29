@@ -404,3 +404,14 @@ class TestQuickStart(unittest.TestCase):
         self.assertIn("--no-network", doc)
         self.assertIn("-NoService", doc)
         self.assertIn("admin / admin", doc)
+
+    def test_ollama_installed_by_all_installers(self):
+        """
+        ollama ставят и установка, и обновление, на всех трёх системах:
+        на маке это единственный путь к локальным моделям (Metal), и
+        пропавший из одного скрипта ollama означал бы, что «обновлённая»
+        установка беднее свежей.
+        """
+        for name in ("install.sh", "update.sh", "install.ps1"):
+            src = (ROOT / "install" / name).read_text(encoding="utf-8")
+            self.assertIn("ollama", src.lower(), name)
