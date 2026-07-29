@@ -186,6 +186,16 @@ else
   warn "Повторить потом: $TARGET/venv/bin/python -m pip install -r $TARGET/requirements.txt"
 fi
 
+# vllm живёт вне requirements.txt (ставится только там, где есть карта
+# NVIDIA), поэтому обновляется отдельно — на тех же условиях, что ставился.
+if "$TARGET/venv/bin/python" -c "import vllm" 2>/dev/null \
+   || command -v nvidia-smi >/dev/null 2>&1; then
+  say "Обновляю vllm"
+  "$TARGET/venv/bin/python" -m pip install --quiet --upgrade vllm \
+    2>>/tmp/kb-pip-$STAMP.log && ok "vllm обновлён" \
+    || warn "vllm не обновился (не страшно: работает прежняя версия)"
+fi
+
 say "Проверяю совместимость данных"
 "$TARGET/venv/bin/python" -c "
 import sys; sys.path.insert(0, '$TARGET')

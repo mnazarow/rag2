@@ -177,3 +177,54 @@ class TestLocalAndCloud(Isolated):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMacModelSupport(Isolated):
+    """Запуск моделей на встроенной видеокарте мака — через ollama."""
+
+    def _mac(self, ram_gb=32, has_ollama=True):
+        import platform
+        from unittest import mock
+
+        import models
+        return (mock.patch.object(platform, "system", return_value="Darwin"),
+                mock.patch.object(platform, "machine", return_value="arm64"),
+                mock.patch.object(models, "_total_ram",
+                                  return_value=ram_gb * 1024 ** 3),
+                mock.patch.object(models.shutil, "which",
+                                  lambda x: "/x/ollama"
+                                  if (x == "ollama" and has_ollama) else None))
+
+    def test_apple_silicon_counts_as_gpu(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            for m in self._mac():
+                st.enter_context(m)
+            hw = models.hardware()
+        self.assertTrue(hw.get("apple_silicon"))
+        self.assertGreater(hw["vram_total_gb"], 15)
+
+    def test_engine_resolves_to_ollama_on_mac(self):
+        import contextlib
+
+        import models
+        spec = models.BY_ID["qwen3.6-27b"]
+        with contextlib.ExitStack() as st:
+            for m in self._mac():
+                st.enter_context(m)
+            self.assertEqual(models.resolve_engine(spec), "ollama")
+        # На линуксе — как было
+        self.assertEqual(models.resolve_engine(spec), "vllm")
+
+    def test_model_without_ollama_tag_explained(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            for m in self._mac():
+                st.enter_context(m)
+            chk = models.check("t-pro-2.0")
+        self.assertFalse(chk["ok"])
+        self.assertTrue(any("ollama" in p for p in chk["problems"]), chk["problems"])

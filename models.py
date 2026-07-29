@@ -295,6 +295,18 @@ def hardware() -> dict:
     info["disk_free_gb"] = round(shutil.disk_usage(str(config.DATA_DIR)).free / 1024 ** 3, 1)
     info["gpus"] = gpus()
     info["vram_total_gb"] = round(sum(g["memory_total_gb"] for g in info["gpus"]), 1)
+    # Apple Silicon: видеокарта встроена, память единая. Metal может
+    # занять примерно две трети общей памяти — эту долю и показываем как
+    # доступную видеопамять, чтобы проверка «поместится ли» работала и
+    # на маке, а не отвечала «карт нет».
+    if not info["gpus"] and _apple_silicon():
+        usable = round(info["ram_gb"] * 0.66, 1)
+        info["gpus"] = [{"index": 0, "name": _cpu_model() or "Apple Silicon",
+                         "memory_total_gb": usable, "memory_used_gb": 0.0,
+                         "utilization": 0, "temperature": 0, "power_w": 0,
+                         "unified": True}]
+        info["vram_total_gb"] = usable
+        info["apple_silicon"] = True
     info["engines"] = {
         "vllm": _has_python_module("vllm"),
         "ollama": bool(shutil.which("ollama")),
@@ -303,6 +315,26 @@ def hardware() -> dict:
         "huggingface-cli": bool(shutil.which("huggingface-cli") or shutil.which("hf")),
     }
     return info
+
+
+def _apple_silicon() -> bool:
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def resolve_engine(spec: "ModelSpec", engine: str | None = None) -> str:
+    """
+    Каким движком запускать модель на ЭТОЙ машине.
+
+    vllm не поддерживает macOS: на маке языковые модели запускаются
+    через ollama (Metal, встроенная видеокарта). Разрешение движка
+    вынесено в одно место, чтобы install, serve и check не разошлись.
+    """
+    engine = engine or spec.engine
+    if engine == "vllm" and _apple_silicon():
+        if spec.ollama_tag:
+            return "ollama"
+        # тега нет — честно оставляем vllm, check() объяснит проблему
+    return engine
 
 
 def _cpu_model() -> str:
@@ -428,7 +460,7 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
     spec = BY_ID.get(model_id)
     if not spec:
         raise ValueError(f"нет такой модели в каталоге: {model_id}")
-    engine = engine or spec.engine
+    engine = resolve_engine(spec, engine)
     say = progress or (lambda text: log.info("%s", text))
 
     hw = hardware()
@@ -438,7 +470,9 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
 
     if engine == "ollama" and spec.ollama_tag:
         if not shutil.which("ollama"):
-            raise RuntimeError("не установлен ollama — поставьте его или выберите vllm")
+            hint = ("brew install ollama" if platform.system() == "Darwin"
+                    else "https://ollama.com/download")
+            raise RuntimeError(f"не установлен ollama — поставьте его: {hint}")
         say(f"Загружаю через ollama: {spec.ollama_tag}")
         proc = subprocess.Popen(["ollama", "pull", spec.ollama_tag],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -497,6 +531,16 @@ def _pid_file() -> Path:
     return Path(config.DATA_DIR) / "model_server.json"
 
 
+def _ollama_alive() -> bool:
+    """Отвечает ли сервер ollama на стандартном порту."""
+    try:
+        import httpx
+        return httpx.get("http://127.0.0.1:11434/api/version",
+                         timeout=2).status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def status() -> dict:
     path = _pid_file()
     if not path.exists():
@@ -507,7 +551,11 @@ def status() -> dict:
         return {"running": False}
     pid = state.get("pid")
     alive = False
-    if pid:
+    if state.get("external"):
+        # Сервер поднят не нами (ollama-приложение на маке): проверяем
+        # не процесс, которого у нас нет, а сам порт.
+        alive = _ollama_alive()
+    elif pid:
         try:
             os.kill(pid, 0)
             alive = True
@@ -525,16 +573,31 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
     spec = BY_ID.get(model_id)
     if not spec:
         raise ValueError(f"нет такой модели: {model_id}")
-    engine = engine or spec.engine
+    engine = resolve_engine(spec, engine)
     port = port or config.LOCAL_MODEL_PORT
     stop()
 
     if engine == "ollama":
         if not shutil.which("ollama"):
-            raise RuntimeError("не установлен ollama")
-        proc = subprocess.Popen(["ollama", "serve"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            hint = ("brew install ollama" if platform.system() == "Darwin"
+                    else "https://ollama.com/download")
+            raise RuntimeError(f"не установлен ollama — поставьте его: {hint}")
+        if not spec.ollama_tag:
+            raise RuntimeError("у этой модели нет варианта для ollama — "
+                               "выберите другую из каталога")
         base_url = "http://127.0.0.1:11434/v1"
+        # На маке ollama обычно уже работает как приложение или демон —
+        # второй экземпляр упадёт с «address already in use». Поднимаем
+        # свой процесс, только если сервер ещё не отвечает.
+        proc = None
+        if not _ollama_alive():
+            proc = subprocess.Popen(["ollama", "serve"],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            for _ in range(20):
+                if _ollama_alive():
+                    break
+                time.sleep(0.5)
         served = spec.ollama_tag
     elif engine == "vllm":
         if not _has_python_module("vllm"):
@@ -568,7 +631,8 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
         raise RuntimeError(f"запуск через «{engine}» из интерфейса не поддерживается; "
                            "смотрите документацию по ручной установке")
 
-    state = {"pid": proc.pid, "model": spec.id, "engine": engine,
+    state = {"pid": proc.pid if proc else None, "model": spec.id, "engine": engine,
+             "external": proc is None,
              "base_url": base_url, "served_name": served, "started": time.time()}
     _pid_file().write_text(json.dumps(state, ensure_ascii=False))
 
@@ -619,18 +683,30 @@ def check(model_id: str) -> dict:
     problems: list[str] = []
     notes: list[str] = []
 
-    if spec.engine == "vllm" and not _has_python_module("vllm"):
+    engine = resolve_engine(spec)
+    if engine == "vllm" and _apple_silicon():
+        problems.append("vllm на macOS не работает, а варианта для ollama у "
+                        "этой модели нет — выберите из каталога модель с "
+                        "тегом ollama (например, Qwen3.6 или Gemma)")
+    elif engine == "vllm" and not _has_python_module("vllm"):
         problems.append("не установлен vllm (pip install vllm) — "
                         "он и запускает модель")
-    if spec.engine == "ollama" and not shutil.which("ollama"):
-        problems.append("не установлен ollama")
+    if engine == "ollama" and not shutil.which("ollama"):
+        hint = ("brew install ollama" if platform.system() == "Darwin"
+                else "с сайта ollama.com")
+        problems.append(f"не установлен ollama — поставьте: {hint}")
+    if engine == "ollama" and spec.engine == "vllm":
+        notes.append("на macOS модель запускается через ollama — "
+                     "встроенная видеокарта (Metal), vllm здесь не работает")
 
     vram = hw.get("vram_total_gb") or 0
     if vram == 0:
         problems.append("видеокарт не найдено: модель такого размера на "
                         "процессоре будет отвечать минутами")
     elif spec.vram_gb > vram:
-        problems.append(f"нужно {spec.vram_gb} ГБ видеопамяти, доступно {vram} ГБ")
+        kind = ("единой памяти (Apple Silicon)" if hw.get("apple_silicon")
+                else "видеопамяти")
+        problems.append(f"нужно {spec.vram_gb} ГБ {kind}, доступно {vram} ГБ")
     elif spec.vram_gb > vram * config.LOCAL_MODEL_GPU_FRACTION:
         notes.append(f"модель займёт почти всю видеопамять ({spec.vram_gb} из "
                      f"{vram} ГБ) — на зрение и эмбеддинги места не останется")
@@ -651,7 +727,7 @@ def check(model_id: str) -> dict:
     return {"ok": not problems, "model": spec.id, "title": spec.title,
             "problems": problems, "notes": notes,
             "vram_needed": spec.vram_gb, "vram_available": vram,
-            "installed": is_installed(spec), "engine": spec.engine}
+            "installed": is_installed(spec), "engine": engine}
 
 
 def stop() -> bool:

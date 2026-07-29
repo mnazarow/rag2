@@ -332,17 +332,36 @@ run "'$VENV_PY' -m pip install --quiet -r '$TARGET/requirements.txt'" \
        echo "     Проверьте интернет. За прокси: export HTTPS_PROXY=http://адрес:порт"
        exit 1; }
 ok "Основные зависимости готовы"
+
+# vllm ставится сам, когда есть куда: сервер локальной модели нужен
+# ровно на машинах с видеокартой NVIDIA. Без неё пакет бесполезен
+# (а на macOS официально не поддерживается — используйте Ollama),
+# поэтому там он не ставится, и это не ошибка.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  ok "Видеокарта найдена: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+  say "Ставлю vllm — сервер локальной модели (долго, несколько гигабайт)"
+  run "'$VENV_PY' -m pip install --quiet vllm" || \
+    warn "vllm не поставился — повторите: $VENV_PY -m pip install vllm"
+elif [ "$PLATFORM" = macos ]; then
+  # На маке локальные модели работают через ollama на встроенной
+  # видеокарте (Metal). Ставим его, если ещё нет: без него раздел
+  # «Модели» на маке может только смотреть на каталог.
+  if command -v ollama >/dev/null 2>&1; then
+    ok "ollama уже установлен — модели пойдут на встроенной видеокарте"
+  elif command -v brew >/dev/null 2>&1 && [ "$WITH_PACKAGES" = 1 ]; then
+    say "Ставлю ollama — запуск моделей на встроенной видеокарте (Metal)"
+    run "brew install ollama" || warn "ollama не поставился: brew install ollama"
+  else
+    warn "Для локальных моделей на маке нужен ollama: brew install ollama"
+  fi
+elif [ "$WITH_GPU" = 1 ]; then
+  warn "Видеокарта NVIDIA не найдена — vllm не ставлю; локальные модели"
+  echo "     будут работать очень медленно. Облачный провайдер разумнее."
+fi
 if [ "$WITH_GPU" = 1 ]; then
   say "Ставлю библиотеки для локальных моделей — это долго и займёт несколько гигабайт"
   run "'$VENV_PY' -m pip install --quiet sentence-transformers faster-whisper" || \
     warn "Часть библиотек не поставилась — локальные модели можно доставить позже"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    ok "Видеокарта найдена: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
-    run "'$VENV_PY' -m pip install --quiet vllm" || \
-      warn "vllm не поставился — поставьте вручную по инструкции проекта"
-  else
-    warn "Видеокарта не найдена — локальные модели будут работать очень медленно"
-  fi
 fi
 
 # -------------------------------------------------------------- настройки --
