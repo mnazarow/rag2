@@ -222,6 +222,18 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
         logger.warning("вопрос содержит попытку переопределить правила "
                        "(пользователь %s): %s", user_id, guard["matched"][:2])
 
+    # Уточняющий вопрос («а цена?», «какая глубина погружения?») наследует
+    # модель и бренд из предыдущей реплики этого же разговора. Поиск и
+    # маршрутизация работают с дополненным вопросом; сам текст сотрудника
+    # не переписывается, а модель получает явную пометку о контексте.
+    import dialog
+    chat_key = chat_id if chat_id is not None else user_id
+    search_question, inherited = dialog.augment(chat_key, question)
+    if inherited:
+        prompt_question += ("\n(Уточняющий вопрос в разговоре: речь идёт о "
+                            + ", ".join(inherited) + ")")
+    dialog.remember(chat_key, question)
+
     # 1. Выверенный экспертом ответ — если есть близкий, отдаём его.
     #
     # Роль учитывается и здесь. Выверенный ответ пишет человек, и он
@@ -231,11 +243,11 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
     # к утечке.
     # Кандидатов берём несколько: топ-1 по BM25 может не пройти порог
     # сходства, а дословно совпадающий эталон — стоять вторым.
-    golden = search_mod.golden_search(question, limit=5, role=role)
+    golden = search_mod.golden_search(search_question, limit=5, role=role)
     best = max(golden,
-               key=lambda g: _golden_similarity(question, g["question"]),
+               key=lambda g: _golden_similarity(search_question, g["question"]),
                default=None)
-    if best and _golden_is_close(question, best["question"]):
+    if best and _golden_is_close(search_question, best["question"]):
         g = best
         db.run("UPDATE golden_qa SET hits=hits+1 WHERE id=?", (g["id"],))
         ans = Answer(text=g["answer"] + "\n\n_Ответ выверен экспертом._",
@@ -249,12 +261,13 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
 
     # 2. Ценовые вопросы — в структурированную таблицу, не в векторный поиск.
     product_rows: list[dict] = []
-    if prices.looks_like_price_question(question) or prices.ARTICLE_RX.search(question):
-        product_rows = prices.search_products(question, limit=8, role=role)
+    if prices.looks_like_price_question(search_question) \
+            or prices.ARTICLE_RX.search(search_question):
+        product_rows = prices.search_products(search_question, limit=8, role=role)
 
     # 3. Документный поиск.
     _t = time.time()
-    hits = search_mod.search(question, role=role)
+    hits = search_mod.search(search_question, role=role)
     metrics.record_stage("поиск", int((time.time() - _t) * 1000))
     conf = search_mod.confidence(hits)
     logger.debug("найдено фрагментов: %d, лучшая оценка %.5f", len(hits), conf)

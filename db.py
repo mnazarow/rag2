@@ -521,7 +521,14 @@ class VectorStore:
                 and Path(config.VECTOR_IDS_PATH).exists()):
             return
         try:
-            matrix = np.load(config.VECTORS_PATH)
+            # Большая матрица читается через mmap: процессам, которые
+            # векторы только читают (бот, админка), незачем держать в
+            # памяти гигабайты целиком. Дозапись всё равно материализует
+            # матрицу — это плата индексации, а не каждого вопроса.
+            size_mb = Path(config.VECTORS_PATH).stat().st_size / 2**20
+            mmap_mode = ("r" if config.VECTORS_MMAP_MB
+                         and size_mb > config.VECTORS_MMAP_MB else None)
+            matrix = np.load(config.VECTORS_PATH, mmap_mode=mmap_mode)
             ids = json.loads(Path(config.VECTOR_IDS_PATH).read_text())
             # Рассогласование — тоже повреждение: обычно это остановка
             # процесса между записью двух файлов.
@@ -552,6 +559,11 @@ class VectorStore:
         оставляла обрезанный файл векторов или рассогласованную пару.
         """
         self._flush_pending()
+        # Матрица, отображённая из этого же файла и не изменившаяся,
+        # в перезаписи не нуждается — а перезапись через самоё себя
+        # ещё и опасна.
+        if isinstance(self.matrix, np.memmap):
+            return
         atomic_write(Path(config.VECTORS_PATH), lambda fh: np.save(fh, self.matrix))
         atomic_write(Path(config.VECTOR_IDS_PATH),
                      lambda fh: fh.write(json.dumps(self.ids).encode()))
@@ -560,7 +572,7 @@ class VectorStore:
         """Вливает накопленные пачки в матрицу одним vstack."""
         if not self._pending:
             return
-        parts = ([self.matrix] if self.matrix.size else []) + self._pending
+        parts = ([np.asarray(self.matrix)] if self.matrix.size else []) + self._pending
         self.matrix = np.vstack(parts)
         self._pending = []
 

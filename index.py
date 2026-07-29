@@ -87,6 +87,41 @@ def _drop_document(doc_id: int) -> None:
     conn.commit()
 
 
+# Файлы, изменение которых меняет РЕЗУЛЬТАТ индексации: другое разбиение,
+# другая нормализация, другой токенизатор. Если хоть один изменился после
+# последней сборки, индекс и запросы живут по разным правилам — «водомет»
+# из вопроса нормализован по-новому, а в индексе лежит по-старому, и
+# качество тихо проседает без единой ошибки в журнале.
+PIPELINE_FILES = ("chunk.py", "normtext.py", "lsa.py", "extract.py")
+
+
+def pipeline_fingerprint() -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for name in PIPELINE_FILES:
+        f = Path(config.BASE_DIR) / name
+        if f.exists():
+            h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def record_pipeline() -> None:
+    """Запоминает, каким конвейером собран индекс."""
+    db.run("INSERT OR REPLACE INTO schema_meta(key, value) VALUES "
+           "('pipeline', ?)", (pipeline_fingerprint(),))
+
+
+def pipeline_state() -> dict:
+    """Совпадает ли конвейер индекса с текущим кодом."""
+    row = db.q1("SELECT value FROM schema_meta WHERE key='pipeline'")
+    stored = row["value"] if row else None
+    chunks = db.q1("SELECT COUNT(*) n FROM chunks")["n"]
+    current = pipeline_fingerprint()
+    return {"stored": stored, "current": current, "chunks": chunks,
+            "stale": bool(stored and chunks and stored != current),
+            "never_recorded": stored is None and chunks > 0}
+
+
 _last_vec_save = 0.0
 
 
@@ -313,6 +348,14 @@ def build(force: bool = False, limit: int | None = None, verbose: bool = False,
     removed = reconcile(seen) if not limit else 0
     deprecated = prices.deprecate_older_prices()
     db.vectors().save()
+    # Отпечаток записывается, только когда индекс действительно собран
+    # текущим конвейером целиком: при force всё разобрано заново, а при
+    # первой сборке старых фрагментов ещё нет. Инкрементальный проход
+    # после смены конвейера отпечаток НЕ обновляет — неизменённые файлы
+    # остались разобранными по-старому.
+    if not limit and (force or not db.q1(
+            "SELECT value FROM schema_meta WHERE key='pipeline'")):
+        record_pipeline()
     emit("extract", "ok", f"готово: {counts}", total, total)
     emit("prices", "ok", f"устаревших прайсов помечено: {deprecated}")
     say(f"Готово за {(time.time()-started)/60:.1f} мин. {counts}, "
@@ -522,7 +565,8 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Индексация корпоративной базы знаний")
     parser.add_argument("command", choices=["build", "update", "watch", "stats", "repair",
-                                            "train-lsa", "reembed", "ocr-queue"])
+                                            "train-lsa", "reembed", "ocr-queue",
+                                            "pipeline-check"])
     parser.add_argument("--force", action="store_true", help="переиндексировать всё заново")
     parser.add_argument("--limit", type=int, help="обработать только N файлов (для теста)")
     parser.add_argument("--interval", type=int, default=60, help="интервал watch, секунд")
@@ -532,6 +576,8 @@ def main() -> None:
     parser.add_argument("--only-missing", action="store_true",
                         help="reembed: досчитать недостающие, не пересобирая всё")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--enqueue", action="store_true",
+                        help="pipeline-check: поставить переиндексацию в очередь")
     args = parser.parse_args()
 
     if args.command in ("build", "update"):
@@ -549,6 +595,34 @@ def main() -> None:
         reembed(provider=args.provider, batch=args.batch, only_missing=args.only_missing)
     elif args.command == "ocr-queue":
         ocr_queue()
+    elif args.command == "pipeline-check":
+        # Вызывается обновлением: изменился ли способ разбиения или
+        # нормализации со времени последней сборки индекса. Если да и
+        # попросили --enqueue — полная переиндексация встаёт в очередь
+        # заданий и выполнится, как только поднимется админка.
+        db.init()
+        state = pipeline_state()
+        if not state["chunks"]:
+            print("Индекс пуст — проверять нечего.")
+            return
+        if not state["stale"] and not state["never_recorded"]:
+            print("Конвейер индексации не менялся: пересборка не нужна.")
+            return
+        print("Конвейер индексации изменился со времени последней сборки:")
+        print("  индекс разобран по старым правилам, поиск — по новым.")
+        if args.enqueue:
+            try:
+                import handlers  # noqa: F401 — регистрация обработчиков
+                import jobs
+                job = jobs.enqueue("reindex_full", "переиндексация после обновления",
+                                   created_by="обновление")
+                print(f"  Переиндексация поставлена в очередь (задача {job['id']}) — "
+                      "начнётся, как только запустится админка.")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  Не удалось поставить в очередь ({exc}) — запустите вручную:")
+                print("  python index.py build --force")
+        else:
+            print("  Запустите: python index.py build --force")
 
 
 if __name__ == "__main__":

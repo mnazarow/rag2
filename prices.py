@@ -270,8 +270,13 @@ def search_products(query: str, limit: int = 10, only_current: bool = True,
     # слова, FTS шёл через OR — и возвращались все Водометы разом, а в
     # ответ уходила цена первого попавшегося.
     signatures = MODEL_SIGNATURE_RX.findall(query)
-    if terms:
-        fts_query = " OR ".join(f'"{t}"' for t in terms[:8])
+    # Подпись модели участвует в полнотекстовом запросе и сама по себе:
+    # уточняющий вопрос «а цена? (55/75)» иных слов не содержит вовсе,
+    # а «55/75» для FTS — фраза из двух токенов, ищется отлично.
+    if terms or signatures:
+        parts = [f'"{t}"' for t in terms[:8]]
+        parts += [f'"{sig}"' for sig in signatures[:4] if sig not in terms]
+        fts_query = " OR ".join(parts)
         try:
             for row in db.q(
                 f"""SELECT p.*, d.rel_path, d.file_name, d.section,

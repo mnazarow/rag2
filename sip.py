@@ -235,7 +235,11 @@ class Conversation:
                         "число вопросов. Перезвоните, пожалуйста, позже."), b""
             self.turns += 1
             # Человек ждёт на линии — самая срочная очередь к модели.
-            res = answer_mod.ask(question, user_name=self.caller, chat_id=None,
+            # Ключ разговора — звонок: уточняющие вопросы в рамках одного
+            # звонка наследуют обсуждаемую модель (отрицательный, чтобы
+            # в журнале не путаться с чатами Telegram).
+            call_key = -(abs(hash(str(self.call_id))) % 10**9) or -1
+            res = answer_mod.ask(question, user_name=self.caller, chat_id=call_key,
                                  role=self.role, source="голос")
             text = _shorten_for_phone(res.text)
             out = Path(tmp) / "out.ogg"

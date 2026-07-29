@@ -227,11 +227,28 @@ def _restore_drill(payload: dict, progress) -> dict:
     import backup
     import tempfile
     from pathlib import Path as _P
-    archives = backup.archives()
-    if not archives:
-        raise jobs.JobError("копий нет")
-    target = archives[0]
-    progress(f"Разворачиваю {target.name} во временную папку")
+    # Восстанавливаться в аварию придётся из ЗЕРКАЛА — локальные копии
+    # погибнут вместе с диском. Значит, и учиться восстанавливаться надо
+    # на зеркальной копии: локальная — лишь запасной вариант для
+    # установок, где зеркало не настроено.
+    target = None
+    source = "локальная копия"
+    import config as _cfg
+    if _cfg.BACKUP_MIRROR_DIR:
+        mirror = _P(_cfg.BACKUP_MIRROR_DIR).expanduser()
+        mirrored = sorted(mirror.glob("*.tar.gz"),
+                          key=lambda f: f.stat().st_mtime, reverse=True) \
+            if mirror.exists() else []
+        if mirrored:
+            target, source = mirrored[0], "зеркало"
+        else:
+            progress("Зеркало настроено, но копий в нём нет — проверяю локальную")
+    if target is None:
+        archives = backup.archives()
+        if not archives:
+            raise jobs.JobError("копий нет")
+        target = archives[0]
+    progress(f"Разворачиваю {target.name} ({source}) во временную папку")
     report = backup.verify_archive(target)
     if not report["ok"]:
         raise jobs.JobError(f"копия не разворачивается: {report['error']}")

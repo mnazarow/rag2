@@ -338,3 +338,62 @@ class TestAnalytics(Isolated):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPipelineFingerprint(Isolated):
+    """Индекс помнит, каким конвейером собран, и замечает расхождение."""
+
+    def _seed(self):
+        self.db.run("INSERT INTO documents (rel_path, abs_path, file_name, ext, "
+                    "content_hash, status) VALUES ('a','/a','a','.txt','h','ok')")
+        self.db.run("INSERT INTO chunks (doc_id, ord, text, n_chars) "
+                    "VALUES (1,0,'текст',5)")
+
+    def test_fresh_index_not_stale(self):
+        import index
+        self._seed()
+        index.record_pipeline()
+        self.assertFalse(index.pipeline_state()["stale"])
+
+    def test_changed_pipeline_detected_and_alerted(self):
+        import alerts
+        import index
+        self._seed()
+        self.db.run("INSERT OR REPLACE INTO schema_meta(key, value) "
+                    "VALUES ('pipeline', 'старый')")
+        self.assertTrue(index.pipeline_state()["stale"])
+        keys = [i["key"] for i in alerts.collect()]
+        self.assertIn("pipeline_stale", keys)
+
+    def test_old_install_without_fingerprint(self):
+        import index
+        self._seed()
+        st = index.pipeline_state()
+        self.assertTrue(st["never_recorded"])
+
+
+class TestVectorsMmap(Isolated):
+    """Большая матрица читается через mmap и переживает дозапись."""
+
+    def test_mmap_roundtrip(self):
+        import importlib
+        import os
+
+        import numpy as np
+        os.environ["VECTORS_MMAP_MB"] = "1"
+        importlib.reload(self.config)
+        try:
+            store = self.db.VectorStore()
+            vecs = np.random.rand(1500, 256).astype(np.float32)
+            store.add(range(1, 1501), vecs)
+            store.save()
+            fresh = self.db.VectorStore()
+            self.assertIsInstance(fresh.matrix, np.memmap)
+            self.assertEqual(fresh.search(vecs[0], 1)[0][0], 1)
+            fresh.add([2000], np.random.rand(1, 256).astype(np.float32))
+            fresh.save()
+            again = self.db.VectorStore()
+            self.assertEqual(len(again), 1501)
+        finally:
+            os.environ.pop("VECTORS_MMAP_MB", None)
+            importlib.reload(self.config)

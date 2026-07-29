@@ -75,6 +75,32 @@ def check(role: str = "процесс") -> dict:
     elif writable and free_gb < 10:
         warn.append(f"на диске с данными свободно всего {free_gb:.1f} ГБ")
 
+    # --- поместится ли векторный индекс в память ---
+    # Матрица векторов на большой базе — гигабайты. Прогноз здесь, а не
+    # OOM-киллер ночью: администратор должен узнать о пределе заранее.
+    try:
+        vec = Path(config.VECTORS_PATH)
+        if vec.exists():
+            size_gb = vec.stat().st_size / 2**30
+            ram_gb = 0.0
+            try:
+                import os as _os
+                ram_gb = (_os.sysconf("SC_PAGE_SIZE")
+                          * _os.sysconf("SC_PHYS_PAGES")) / 2**30
+            except (ValueError, OSError, AttributeError):
+                pass
+            if ram_gb and size_gb > ram_gb * 0.5:
+                warn.append(
+                    f"матрица векторов занимает {size_gb:.1f} ГБ при {ram_gb:.0f} ГБ "
+                    f"памяти. Чтение через mmap уже включено (VECTORS_MMAP_MB), "
+                    f"но индексация материализует матрицу целиком — при росте "
+                    f"базы переходите на VECTOR_BACKEND=qdrant")
+            elif ram_gb:
+                ok.append(f"векторный индекс: {size_gb:.1f} ГБ "
+                          f"при {ram_gb:.0f} ГБ памяти")
+    except OSError:
+        pass
+
     # --- пароль по умолчанию ---
     try:
         import security
