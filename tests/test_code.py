@@ -28,6 +28,7 @@ from tests.base import ROOT
 
 # Таблицы, живущие в отдельной базе телеметрии.
 TELEMETRY_TABLES = {
+    "heartbeats",
     "server_metrics", "model_usage", "stage_timings", "log_records",
     "traces", "llm_queue", "alerts", "alert_history", "telemetry_marker",
 }

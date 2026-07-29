@@ -20,6 +20,7 @@ from pathlib import Path
 
 import config
 import db
+import normtext
 import extract
 
 ARTICLE_HINTS = ("артикул", "код", "арт.", "арт", "sku", "код товара", "номенклатура")
@@ -155,7 +156,8 @@ def index_price_file(doc_id: int, abs_path: Path, brand: str | None,
                        (doc_id,)).fetchall()
     conn.executemany(
         "INSERT INTO products_fts(rowid, article, name, brand) VALUES (?,?,?,?)",
-        [(r["id"], r["article"] or "", r["name"] or "", r["brand"] or "") for r in ids])
+        [(r["id"], r["article"] or "", normtext.canon(r["name"] or ""), r["brand"] or "")
+         for r in ids])
     conn.commit()
     return len(items)
 
@@ -192,7 +194,16 @@ def deprecate_older_prices() -> int:
 PRICE_QUESTION_RX = re.compile(
     r"\b(цен[аыуе]|стоимост|прайс|почём|почем|сколько стоит|ррц|скидк|прайс-лист)\b", re.I)
 ARTICLE_RX = re.compile(r"\b(?:арт\.?|артикул|код)\s*[:№]?\s*([A-Za-zА-Яа-я0-9][\w\-./]{2,20})\b", re.I)
-BARE_ARTICLE_RX = re.compile(r"\b(\d{4,8}(?:\.[A-ZА-Я0-9]{1,3})?)\b")
+# Число без пометки «арт.» считается артикулом с двумя оговорками.
+# Первая: суффикс ловится в любом регистре («500095.f» — тот же артикул,
+# что «500095.F»). Вторая: числа, похожие на год (1900–2099), исключены —
+# вопрос «какая цена в прайсе 2024 года» искал артикул «2024», и если
+# такой существовал, в ответ уходил посторонний товар под грифом
+# «точные данные из таблицы».
+BARE_ARTICLE_RX = re.compile(r"\b((?!19\d\d\b|20\d\d\b)\d{4,8}(?:\.[A-ZА-Я0-9]{1,3})?)\b", re.I)
+# Подпись модели: «55/75», «0,5-40» — числа с разделителем, различающие
+# соседние модели в одной линейке.
+MODEL_SIGNATURE_RX = re.compile(r"\b\d+(?:[.,]\d+)?(?:[/\-]\d+(?:[.,]\d+)?)+\b")
 
 
 def looks_like_price_question(text: str) -> bool:
@@ -230,19 +241,35 @@ def search_products(query: str, limit: int = 10, only_current: bool = True,
 
     articles = ARTICLE_RX.findall(query) + BARE_ARTICLE_RX.findall(query)
     for art in articles:
-        for row in db.q(
+        rows = db.q(
             f"""SELECT p.*, d.rel_path, d.file_name, d.section FROM products p
                 JOIN documents d ON d.id=p.doc_id
                 WHERE p.article = ? COLLATE NOCASE {where_current} {section_sql}
                 LIMIT ?""",
-                (art, *section_args, limit)):
+                (art, *section_args, limit))
+        if not rows:
+            # Точного совпадения нет — суффиксные варианты того же
+            # артикула («500095» находит «500095.F»).
+            rows = db.q(
+                f"""SELECT p.*, d.rel_path, d.file_name, d.section FROM products p
+                    JOIN documents d ON d.id=p.doc_id
+                    WHERE p.article LIKE ? {where_current} {section_sql}
+                    LIMIT ?""",
+                    (str(art) + ".%", *section_args, limit))
+        for row in rows:
             if row["id"] not in seen:
                 seen.add(row["id"])
                 results.append(dict(row))
     if len(results) >= limit:
         return results[:limit]
 
+    query = normtext.canon(query)
     terms = [t for t in re.findall(r"[\wА-Яа-яё\-]{3,}", query) if not PRICE_QUESTION_RX.match(t)]
+    # Подпись модели («55/75») — обязательное условие, а не выброшенный
+    # токен. Раньше из «сколько стоит Водомет 55/75» оставались только
+    # слова, FTS шёл через OR — и возвращались все Водометы разом, а в
+    # ответ уходила цена первого попавшегося.
+    signatures = MODEL_SIGNATURE_RX.findall(query)
     if terms:
         fts_query = " OR ".join(f'"{t}"' for t in terms[:8])
         try:
@@ -254,13 +281,30 @@ def search_products(query: str, limit: int = 10, only_current: bool = True,
                     JOIN documents d ON d.id = p.doc_id
                     WHERE products_fts MATCH ? {where_current} {section_sql}
                     ORDER BY rank LIMIT ?""",
-                    (fts_query, *section_args, limit * 2)):
-                if row["id"] not in seen:
-                    seen.add(row["id"])
-                    results.append(dict(row))
+                    (fts_query, *section_args, limit * 4)):
+                if row["id"] in seen:
+                    continue
+                if signatures and not _name_matches_signature(row["name"], signatures):
+                    continue
+                seen.add(row["id"])
+                results.append(dict(row))
         except Exception:  # noqa: BLE001 — некорректный FTS-запрос
             pass
     return results[:limit]
+
+
+def _name_matches_signature(name: str, signatures: list[str]) -> bool:
+    """
+    Есть ли в названии позиции подпись модели из вопроса.
+
+    Сравнение по нормализованным подписям («3,6» и «3.6» — одно число):
+    вопрос про 55/75 не должен приносить цену 60/92, как бы похоже ни
+    называлась остальная часть позиции.
+    """
+    def norm(s: str) -> str:
+        return s.replace(",", ".")
+    in_name = {norm(m) for m in MODEL_SIGNATURE_RX.findall(name or "")}
+    return any(norm(s) in in_name for s in signatures)
 
 
 def format_products(items: list[dict]) -> str:

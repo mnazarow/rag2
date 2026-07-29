@@ -283,6 +283,10 @@ ALERT_CHANNELS = _env("ALERT_CHANNELS", "telegram")     # telegram, log, webhook
 ALERT_WEBHOOK_URL = _env("ALERT_WEBHOOK_URL", "")
 ALERT_REPEAT_HOURS = _env_int("ALERT_REPEAT_HOURS", 12)  # не напоминать чаще
 ALERT_DISK_FREE_GB = _env_int("ALERT_DISK_FREE_GB", 10)
+# Раз в столько минут админка сама гоняет проверки оповещений — дублируя
+# cron: снесённый crontab не должен превращаться в молчащий мониторинг.
+# 0 — выключить самопроверку (только cron).
+ALERTS_SELF_CHECK_MINUTES = _env_int("ALERTS_SELF_CHECK_MINUTES", 60)
 ALERT_OCR_QUEUE = _env_int("ALERT_OCR_QUEUE", 50)
 ALERT_REFUSAL_RATE = _env_float("ALERT_REFUSAL_RATE", 0.35)
 
@@ -422,10 +426,15 @@ RRF_K = _env_int("RRF_K", 60)                           # константа Rec
 # Приоритет свежести: score = ALPHA*relevance + (1-ALPHA)*0.5^(age/HALF_LIFE)
 RECENCY_ALPHA = _env_float("RECENCY_ALPHA", 0.85)
 RECENCY_HALF_LIFE_DAYS = _env_float("RECENCY_HALF_LIFE_DAYS", 540.0)
-# Буст выверенных экспертом ответов (golden Q&A)
-GOLDEN_BOOST = _env_float("GOLDEN_BOOST", 0.25)
-# Ниже этого суммарного скора считаем, что ответа в базе нет.
-MIN_CONFIDENCE = _env_float("MIN_CONFIDENCE", 0.012)
+# Бюджет контекста для модели, символов. Шесть фрагментов по 2800
+# символов плюс прайс — это больше окна маленькой модели; обрезаем
+# честно здесь, а не ошибкой 400 у провайдера.
+CONTEXT_MAX_CHARS = _env_int("CONTEXT_MAX_CHARS", 12000)
+# Ниже этой релевантности (0…1, покрытие значимых слов вопроса лучшим
+# фрагментом) считаем, что ответа в базе нет, и честно об этом говорим.
+# Раньше порог сравнивался с ранговым RRF-скором и был недостижим:
+# минимум для первого места (0.0139) выше прежнего порога (0.012).
+MIN_CONFIDENCE = _env_float("MIN_CONFIDENCE", 0.08)
 
 # ----------------------------------------------------------- переранжирование --
 # Кросс-энкодер читает пару «вопрос + фрагмент» целиком и оценивает,
@@ -656,3 +665,16 @@ ADMIN_PORT = _env_int("ADMIN_PORT", 8800)
 ADMIN_TOKEN = _env("ADMIN_TOKEN", "")     # пусто = без пароля (только localhost!)
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Права: в data/ лежат вопросы сотрудников (персональные данные), роли и
+# журнал доступа, в .env — токен бота. На сервере с несколькими учётками
+# режим 0755/0644 означает «читает кто угодно», включая копии в backups/.
+# Чужие права не трогаем (общая папка команды — законный случай), а свои
+# умолчания ужимаем до владельца.
+import stat as _stat
+for _p, _mode in ((DATA_DIR, 0o700), (BASE_DIR / ".env", 0o600)):
+    try:
+        if _p.exists() and _p.stat().st_uid == os.getuid()                 and _p.stat().st_mode & 0o077:
+            os.chmod(_p, _mode)
+    except (OSError, AttributeError):      # windows или чужой файл
+        pass

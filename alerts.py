@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from pathlib import Path
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -87,15 +88,79 @@ def collect() -> list[dict]:
         add("backup_error", "error", "Не удалось проверить резервные копии",
             str(exc), "Смотрите журнал подсистемы backup.")
 
-    # Место на диске.
+    # Место на диске — на всех разделах, где живут данные, журналы,
+    # копии и распаковки. Раньше проверялся только раздел с данными:
+    # журналы на системном диске могли заполнить его до отказа, и ни
+    # одна проверка этого не видела.
     try:
-        usage = shutil.disk_usage(config.DATA_DIR)
-        free_gb = usage.free / 1e9
-        if free_gb < config.ALERT_DISK_FREE_GB:
-            add("disk", "error", "Кончается место на диске",
-                f"Свободно {free_gb:.1f} ГБ при пороге {config.ALERT_DISK_FREE_GB} ГБ.",
-                "Удалите старые копии и распакованные архивы: "
-                "python backup.py prune, очистите ARCHIVE_WORK_DIR.")
+        seen_devices: set[int] = set()
+        for label, path in (("данные", config.DATA_DIR),
+                            ("журналы", config.LOG_DIR),
+                            ("копии", config.BACKUP_DIR),
+                            ("распаковки", config.ARCHIVE_WORK_DIR)):
+            try:
+                dev = Path(path).stat().st_dev
+            except OSError:
+                continue
+            if dev in seen_devices:
+                continue
+            seen_devices.add(dev)
+            usage = shutil.disk_usage(path)
+            free_gb = usage.free / 1e9
+            if free_gb < config.ALERT_DISK_FREE_GB:
+                add(f"disk_{label}", "error", f"Кончается место на диске ({label})",
+                    f"Свободно {free_gb:.1f} ГБ при пороге "
+                    f"{config.ALERT_DISK_FREE_GB} ГБ: {path}",
+                    "Удалите старые копии и распакованные архивы: "
+                    "python backup.py prune, очистите ARCHIVE_WORK_DIR.")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Живость бота. Процесс, который умер ночью от нехватки памяти,
+    # для сотрудников выглядит как «ассистент молчит», а для админа —
+    # никак: в админке всё зелёное. Пульс пишет сам бот раз в минуту.
+    try:
+        if config.TELEGRAM_BOT_TOKEN:
+            import metrics
+            beat = metrics.last_beat("бот")
+            if beat is None:
+                add("bot_down", "error", "Бот не запущен",
+                    "Токен Telegram настроен, но бот ни разу не отметился.",
+                    "Запустите: python bot.py (или службу kb-assistant-bot).")
+            else:
+                age_min = (datetime.now(timezone.utc)
+                           - datetime.fromisoformat(beat)).total_seconds() / 60
+                if age_min > 10:
+                    add("bot_silent", "error", "Бот перестал отвечать",
+                        f"Последняя отметка о жизни — {age_min:.0f} мин назад.",
+                        "Проверьте процесс bot.py и журнал logs/bot.log; "
+                        "перезапустите службу kb-assistant-bot.")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Копии на том же диске, что и данные, не переживут его отказ.
+    try:
+        if not config.BACKUP_MIRROR_DIR:
+            add("backup_mirror", "warning", "Копии хранятся на том же диске",
+                "BACKUP_MIRROR_DIR не задан: отказ диска унесёт и данные, "
+                "и все резервные копии разом.",
+                "Укажите BACKUP_MIRROR_DIR — сетевую папку или внешний диск.")
+        else:
+            mirror = Path(config.BACKUP_MIRROR_DIR).expanduser()
+            copies = sorted(mirror.glob("*.tar.gz"),
+                            key=lambda f: f.stat().st_mtime, reverse=True)                 if mirror.exists() else []
+            if not copies:
+                add("mirror_empty", "error", "Зеркало копий пусто",
+                    f"В {mirror} нет ни одной копии.",
+                    "Проверьте доступность папки и запустите python backup.py run.")
+            else:
+                age_h = (datetime.now(timezone.utc).timestamp()
+                         - copies[0].stat().st_mtime) / 3600
+                if age_h > config.BACKUP_ALERT_HOURS:
+                    add("mirror_stale", "error", "Зеркало копий устарело",
+                        f"Свежая копия в зеркале — {age_h:.0f} ч назад "
+                        f"при пороге {config.BACKUP_ALERT_HOURS} ч.",
+                        "Проверьте доступность зеркала: python backup.py run")
     except Exception:  # noqa: BLE001
         pass
 
@@ -341,6 +406,14 @@ def check() -> dict:
     items = collect()
     result = notify(items)
     result["items"] = items
+    # Отметка о том, что детектор отказов сам жив: если её возраст
+    # больше пары часов — не выполняются сами проверки, и тишина в
+    # Telegram ничего не значит.
+    try:
+        import metrics
+        metrics.beat("оповещения")
+    except Exception:  # noqa: BLE001
+        pass
     return result
 
 

@@ -205,8 +205,9 @@ def _stem(token: str) -> str:
 
 
 def tokenize(text: str) -> list[str]:
+    import normtext
     out = []
-    for raw in _TOKEN_RX.findall(text.lower()):
+    for raw in _TOKEN_RX.findall(normtext.canon(text).lower()):
         if raw in STOP or len(raw) < 2:
             continue
         out.append(normalize_token(raw))
@@ -363,7 +364,13 @@ class LSAModel:
                 say(f"  разобрано {i} из {len(texts)}")
 
         n_docs = len(texts)
-        candidates = [(t, c) for t, c in df.items() if c >= min_df and c < n_docs * 0.6]
+        # Токены с цифрами (артикулы, обозначения моделей) освобождены от
+        # порога min_df: уникальный артикул встречается ровно в одном
+        # фрагменте — это его нормальное состояние, а не шум. Без этого
+        # исключения смысловой канал слеп именно к самым точным запросам.
+        candidates = [(t, c) for t, c in df.items()
+                      if (c >= min_df or any(ch.isdigit() for ch in t))
+                      and c < n_docs * 0.6]
         candidates.sort(key=lambda x: -x[1])
         vocab = {t: i for i, (t, _c) in enumerate(candidates[:max_features])}
         if len(vocab) < 50:

@@ -32,6 +32,7 @@ import answer as answer_mod
 import config
 import db
 import logging_setup
+import metrics
 
 log = logging_setup.get("bot")
 
@@ -123,17 +124,42 @@ def access_denied_text(user: dict) -> str:
 # ---------------------------------------------------------- форматирование --
 def format_answer(res: answer_mod.Answer) -> str:
     text = html.escape(res.text)
-    if res.hits:
+
+    # Источники — из общего нумерованного списка (прайсы + документы),
+    # той же нумерации, что видела модель. Старый путь по res.hits
+    # оставлен для ответов, собранных без этого списка.
+    sources = res.sources or [
+        {"n": i, "kind": "document", "file_name": h.file_name,
+         "rel_path": h.rel_path, "page": h.page_from,
+         "is_current": h.is_current}
+        for i, h in enumerate(res.hits, 1)]
+    src_block = ""
+    if sources:
         lines = ["", "<b>Источники:</b>"]
-        for i, h in enumerate(res.hits, 1):
-            mark = "" if h.is_current else " ⚠️ устаревшая версия"
-            page = f", с. {h.page_from}" if h.page_from else ""
-            lines.append(f"{i}. {html.escape(h.file_name)}{page}{mark}")
-            lines.append(f"    <code>{html.escape(h.rel_path)}</code>")
-        text += "\n" + "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "…"
-    return text
+        for s in sources:
+            mark = "" if s.get("is_current", 1) else " ⚠️ устаревшая версия"
+            if s.get("kind") == "price":
+                mark = " (прайс-лист)" + mark
+            page = f", с. {s['page']}" if s.get("page") else ""
+            lines.append(f"{s['n']}. {html.escape(s['file_name'])}{page}{mark}")
+            if s.get("rel_path"):
+                lines.append(f"    <code>{html.escape(s['rel_path'])}</code>")
+        src_block = "\n" + "\n".join(lines)
+
+    # Лимит Telegram — 4096. Резать нужно текст ответа, а не хвост
+    # склейки: слепой срез откусывал именно список источников, а если
+    # попадал внутрь HTML-сущности или тега — Telegram отвечал 400
+    # «can't parse entities», и сообщение молча пропадало.
+    budget = 3900 - len(src_block)
+    if len(text) > budget:
+        cut = text[:max(budget, 0)]
+        # Рвём по границе слова: внутри «&quot;» пробелов не бывает,
+        # значит сущность не будет разрезана.
+        space = cut.rfind(" ", max(0, len(cut) - 120))
+        if space > 0:
+            cut = cut[:space]
+        text = cut + "…"
+    return text + src_block
 
 
 def answer_keyboard(query_id: int | None, res: answer_mod.Answer) -> dict:
@@ -210,7 +236,7 @@ def handle_message(user_id: int, chat_id: int, user_name: str | None,
     if wants_voice(user_id, False):
         try:
             import voice
-            reply = config.DATA_DIR / f"reply_{user_id}.ogg"
+            reply = config.DATA_DIR / f"reply_{user_id}_{int(time.time()*1000)}.ogg"
             voice.synthesize(res.text, reply)
             out["voice"] = str(reply)
         except Exception as exc:  # noqa: BLE001
@@ -260,7 +286,8 @@ def handle_voice(user_id: int, chat_id: int, user_name: str | None,
         question = voice.transcribe(audio_path)
     except Exception as exc:  # noqa: BLE001
         log.warning("не удалось распознать голосовое: %s", exc)
-        return {"text": f"Не получилось распознать голосовое сообщение: {exc}"}
+        return {"text": "Не получилось распознать голосовое сообщение: "
+                        f"{logging_setup.mask(str(exc))}"}
     if len(question.strip()) < 3:
         return {"text": "Я не разобрал вопрос. Попробуйте ещё раз или напишите текстом."}
 
@@ -271,7 +298,7 @@ def handle_voice(user_id: int, chat_id: int, user_name: str | None,
            "keyboard": answer_keyboard(res.query_id, res)}
     if wants_voice(user_id, True):
         try:
-            reply = config.DATA_DIR / f"reply_{user_id}.ogg"
+            reply = config.DATA_DIR / f"reply_{user_id}_{int(time.time()*1000)}.ogg"
             voice.synthesize(res.text, reply)
             out["voice"] = str(reply)
         except Exception as exc:  # noqa: BLE001
@@ -397,6 +424,7 @@ class SimpleBot:
             kwargs["proxy"] = config.TELEGRAM_PROXY
             print(f"Telegram через прокси: {config.TELEGRAM_PROXY.split('@')[-1]}")
         self.client = httpx.AsyncClient(**kwargs)
+        self._sem = asyncio.Semaphore(8)
         self.offset = 0
 
     async def call(self, method: str, **params):
@@ -439,6 +467,7 @@ class SimpleBot:
             if config.reload_if_changed():
                 log.warning("настройки изменились — перечитал")
                 _reload_dependents()
+            metrics.beat("бот")
             try:
                 upd = await self.call("getUpdates", offset=self.offset, timeout=50)
             except Exception as exc:  # noqa: BLE001
@@ -447,10 +476,30 @@ class SimpleBot:
                 continue
             for u in upd.get("result", []):
                 self.offset = u["update_id"] + 1
-                try:
-                    await self._dispatch(u)
-                except Exception as exc:  # noqa: BLE001
-                    print("ошибка обработки:", exc)
+                # Вопросы обрабатываются параллельно, а не по одному:
+                # иначе десятый спрашивающий ждёт десять генераций подряд.
+                # Ограничитель держит разумный предел, а настоящий предел
+                # нагрузки на модель — общая межпроцессная очередь.
+                asyncio.create_task(self._dispatch_safe(u))
+
+    async def _dispatch_safe(self, u: dict) -> None:
+        async with self._sem:
+            try:
+                await self._dispatch(u)
+            except Exception as exc:  # noqa: BLE001
+                # Молчание для сотрудника хуже любой ошибки: он не знает,
+                # сломалось или медленно, и задаёт вопрос снова.
+                log.exception("ошибка обработки обновления")
+                chat_id = (u.get("message") or {}).get("chat", {}).get("id")
+                if chat_id:
+                    rid = u.get("update_id", "-")
+                    try:
+                        await self.send(chat_id,
+                                        "Не получилось обработать сообщение. "
+                                        "Попробуйте ещё раз; если повторится — "
+                                        f"сообщите администратору код <code>{rid}</code>.")
+                    except Exception:  # noqa: BLE001
+                        pass
 
     async def download_file(self, file_id: str, dest: Path) -> bool:
         info = await self.call("getFile", file_id=file_id)
@@ -479,7 +528,7 @@ class SimpleBot:
             frm = m.get("from", {})
             await self.call("sendChatAction", chat_id=m["chat"]["id"], action="typing")
             media = m.get("voice") or m.get("audio") or m.get("video_note")
-            tmp = config.DATA_DIR / f"in_{frm.get('id')}.oga"
+            tmp = config.DATA_DIR / f"in_{frm.get('id')}_{m.get('message_id', 0)}.oga"
             if not await self.download_file(media["file_id"], tmp):
                 await self.send(m["chat"]["id"], "Не удалось скачать голосовое сообщение.")
                 return
@@ -490,6 +539,9 @@ class SimpleBot:
                             reply_to=m["message_id"])
             if out.get("voice"):
                 await self.send_voice(m["chat"]["id"], out["voice"])
+            for f in (tmp, Path(out.get("voice") or "")):
+                if f and f.exists():
+                    f.unlink(missing_ok=True)
             return
         if "message" in u and "text" in u["message"]:
             m = u["message"]
@@ -558,7 +610,7 @@ async def run_aiogram(token: str) -> None:
     async def on_voice(message: Message) -> None:
         await bot.send_chat_action(message.chat.id, "typing")
         media = message.voice or message.audio or message.video_note
-        tmp = config.DATA_DIR / f"in_{message.from_user.id}.oga"
+        tmp = config.DATA_DIR / f"in_{message.from_user.id}_{message.message_id}.oga"
         await bot.download(media, destination=tmp)
         out = await asyncio.to_thread(
             handle_voice, message.from_user.id, message.chat.id,
@@ -569,6 +621,9 @@ async def run_aiogram(token: str) -> None:
                             disable_web_page_preview=True)
         if out.get("voice"):
             await bot.send_voice(message.chat.id, FSInputFile(out["voice"]))
+        for f in (tmp, Path(out.get("voice") or "")):
+            if f and f.exists():
+                f.unlink(missing_ok=True)
 
     @dp.callback_query()
     async def on_callback(call: CallbackQuery) -> None:
@@ -587,7 +642,17 @@ async def run_aiogram(token: str) -> None:
 
     me = await bot.get_me()
     print(f"Бот запущен (aiogram): @{me.username}")
-    await dp.start_polling(bot)
+
+    async def _pulse() -> None:
+        while True:
+            metrics.beat("бот")
+            await asyncio.sleep(60)
+
+    pulse = asyncio.create_task(_pulse())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        pulse.cancel()
 
 
 def main() -> None:

@@ -377,6 +377,30 @@ def score(query: str, texts: list[str]) -> list[float] | None:
     return [float(x or 0.0) for x in out]
 
 
+_relevance_scorer: LexicalReranker | None = None
+
+
+def relevance(query: str, texts: list[str]) -> list[float]:
+    """
+    Интерпретируемая релевантность 0…1 для порога отказа.
+
+    Считается всегда лексическим оценщиком, каким бы ни был настроенный
+    провайдер переранжирования. Причина — стабильность шкалы: смысл
+    выставленного администратором MIN_CONFIDENCE не должен меняться от
+    смены реранкера. Покрытие значимых слов запроса с весом по редкости —
+    величина, которую можно объяснить человеку: ноль значит «ни одно
+    существенное слово вопроса в найденном не встретилось».
+    """
+    global _relevance_scorer
+    if _relevance_scorer is None:
+        _relevance_scorer = LexicalReranker()
+    try:
+        return _relevance_scorer.score_pairs(query, texts)
+    except Exception as exc:  # noqa: BLE001 — порог не должен ронять поиск
+        log.warning("оценка релевантности не сработала: %s", exc)
+        return [1.0] * len(texts)
+
+
 def _with_timeout(fn, *args):
     """Считает в отдельном потоке: зависший реранкер не держит ответ вечно."""
     result: list = [None]

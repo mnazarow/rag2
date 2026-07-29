@@ -26,6 +26,8 @@ import argparse
 import sys
 from datetime import datetime, timedelta, timezone
 
+from pathlib import Path
+
 import config
 import db
 import logging_setup
@@ -102,10 +104,61 @@ def clean(dry: bool = False) -> dict:
             removed["llm_queue"] = llm_queue.prune(7)
         except Exception:  # noqa: BLE001
             removed["llm_queue"] = 0
+    # Учёт обращений к моделям и тайминги стадий растут по нескольку строк
+    # на каждый вопрос — без срока хранения телеметрия пухнет вечно.
+    if not dry and config.METRICS_KEEP_DAYS:
+        try:
+            cutoff = _cutoff(config.METRICS_KEEP_DAYS)
+            for table in ("model_usage", "stage_timings"):
+                db.trun(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Распакованные архивы: ключ папки — хеш содержимого, поэтому при
+    # замене архива новой версией старая распаковка остаётся навсегда.
+    removed["unpacked"] = 0
+    if not dry:
+        try:
+            import shutil
+            import time as _time
+            work = Path(config.ARCHIVE_WORK_DIR)
+            if work.exists():
+                horizon = _time.time() - 30 * 86400
+                for d in work.iterdir():
+                    if d.is_dir() and d.stat().st_mtime < horizon:
+                        shutil.rmtree(d, ignore_errors=True)
+                        removed["unpacked"] += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Журналы, которые пишутся мимо ротации (редиректы systemd/launchd и
+    # cron): усечь до хвоста, когда переросли разумный размер.
+    if not dry:
+        try:
+            for name in ("service.log", "bot-service.log", "schedule.log"):
+                f = Path(config.LOG_DIR) / name
+                if f.exists() and f.stat().st_size > 50 * 2**20:
+                    tail = f.read_bytes()[-5 * 2**20:]
+                    f.write_bytes(b"[...ranee usecheno...]\n" + tail)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Базы после удалений сами не худеют: раз в месяц уплотняем. Дёшево
+    # и возвращает место после больших чисток.
+    if not dry:
+        try:
+            import datetime as _dt
+            if _dt.date.today().day == 1:
+                db.connect().execute("VACUUM")
+                db.telemetry().execute("VACUUM")
+        except Exception:  # noqa: BLE001
+            pass
+
     if not dry and any(removed.values()):
         log.warning("очистка по сроку хранения: вопросов %d, цепочек %d, "
-                    "записей очереди %d", removed["queries"], removed["traces"],
-                    removed.get("llm_queue", 0))
+                    "записей очереди %d, распаковок %d", removed["queries"],
+                    removed["traces"], removed.get("llm_queue", 0),
+                    removed["unpacked"])
     return removed
 
 

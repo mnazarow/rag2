@@ -497,6 +497,11 @@ class VectorStore:
         self.ids: list[int] = []
         self.matrix: np.ndarray = np.zeros((0, self.dim), dtype=np.float32)
         self._index: dict[int, int] = {}
+        # Свежедобавленные векторы копятся здесь и вливаются в матрицу
+        # одним vstack перед чтением. Раньше vstack делался на каждый
+        # add — на большой базе это квадратичное копирование гигабайтной
+        # матрицы, и ночная индексация «зависала» именно тут.
+        self._pending: list[np.ndarray] = []
         self.load()
 
     # --- персистентность ---
@@ -511,6 +516,7 @@ class VectorStore:
         журнал и пометка, которую видно в диагностике.
         """
         self.broken = ""
+        self._pending = []
         if not (Path(config.VECTORS_PATH).exists()
                 and Path(config.VECTOR_IDS_PATH).exists()):
             return
@@ -545,9 +551,18 @@ class VectorStore:
         между ними (при `docker stop` это происходило каждый раз)
         оставляла обрезанный файл векторов или рассогласованную пару.
         """
+        self._flush_pending()
         atomic_write(Path(config.VECTORS_PATH), lambda fh: np.save(fh, self.matrix))
         atomic_write(Path(config.VECTOR_IDS_PATH),
                      lambda fh: fh.write(json.dumps(self.ids).encode()))
+
+    def _flush_pending(self) -> None:
+        """Вливает накопленные пачки в матрицу одним vstack."""
+        if not self._pending:
+            return
+        parts = ([self.matrix] if self.matrix.size else []) + self._pending
+        self.matrix = np.vstack(parts)
+        self._pending = []
 
     # --- запись ---
     def add(self, chunk_ids: Sequence[int], vectors: np.ndarray) -> None:
@@ -556,19 +571,21 @@ class VectorStore:
         vectors = np.asarray(vectors, dtype=np.float32)
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         vectors = vectors / np.clip(norms, 1e-9, None)
-        if self.matrix.size == 0:
-            self.matrix = vectors
-            self.ids = list(chunk_ids)
-        else:
-            self.matrix = np.vstack([self.matrix, vectors])
-            self.ids.extend(chunk_ids)
-        self.dim = self.matrix.shape[1]
-        self._index = {cid: i for i, cid in enumerate(self.ids)}
+        start = len(self.ids)
+        self._pending.append(vectors)
+        self.ids = list(self.ids) if not isinstance(self.ids, list) else self.ids
+        self.ids.extend(int(c) for c in chunk_ids)
+        # Индекс дополняется, а не перестраивается: перестройка словаря
+        # на каждую пачку — это O(n²) на всю индексацию.
+        for i, cid in enumerate(chunk_ids):
+            self._index[int(cid)] = start + i
+        self.dim = vectors.shape[1]
 
     def drop_chunks(self, chunk_ids: Iterable[int]) -> None:
         drop = set(chunk_ids)
         if not drop or not self.ids:
             return
+        self._flush_pending()
         keep = [i for i, cid in enumerate(self.ids) if cid not in drop]
         self.matrix = self.matrix[keep] if keep else np.zeros((0, self.dim), np.float32)
         self.ids = [self.ids[i] for i in keep]
@@ -577,6 +594,7 @@ class VectorStore:
     # --- чтение ---
     def search(self, vector: np.ndarray, top_k: int,
                allowed: set[int] | None = None) -> list[tuple[int, float]]:
+        self._flush_pending()
         if self.matrix.size == 0:
             return []
         v = np.asarray(vector, dtype=np.float32).reshape(-1)

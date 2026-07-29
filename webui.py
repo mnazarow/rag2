@@ -2992,6 +2992,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send(200, b'{"ok": true}')
 
+        # Метрики Prometheus — с локального адреса без авторизации:
+        # скрейпер стоит рядом и токенов не умеет, а секретов в метриках
+        # нет. Снаружи — только с токеном, как и всё остальное.
+        if path == "/metrics" and self._client_is_local():
+            import metrics
+            return self._send(200, metrics.prometheus().encode(), "text/plain")
+
         # Общий токен из ссылки принимается один раз: перекладываем его в
         # кук и очищаем адрес, чтобы дальше он не светился ни в истории
         # браузера, ни в Referer, ни в журнале обратного прокси.
@@ -3917,12 +3924,32 @@ def _build_graph() -> dict:
 
 
 def _metrics_thread() -> None:
+    """
+    Вечно живой поток админки: метрики, пульс и — раз в час — проверки
+    оповещений. Проверки продублированы здесь не случайно: расписание
+    cron можно снести при миграции сервера, и тогда тишина в Telegram
+    неотличима от «всё хорошо». Отказавший детектор отказов — самый
+    опасный класс отказов, поэтому у него два независимых носителя:
+    cron и этот поток.
+    """
+    import alerts
     import metrics
+    last_alerts_check = 0.0
     while True:
         try:
             metrics.collect()
+            metrics.beat("админка")
         except Exception:  # noqa: BLE001
             pass
+        if (config.ALERTS_ENABLED
+                and time.time() - last_alerts_check > config.ALERTS_SELF_CHECK_MINUTES * 60
+                and config.ALERTS_SELF_CHECK_MINUTES > 0):
+            last_alerts_check = time.time()
+            try:
+                alerts.check()
+            except Exception:  # noqa: BLE001
+                log.warning("проверка оповещений из админки не отработала",
+                            exc_info=True)
         time.sleep(config.METRICS_INTERVAL_SECONDS)
 
 

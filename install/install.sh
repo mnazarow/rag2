@@ -6,6 +6,7 @@
 #   ./install.sh --with-gpu          — плюс библиотеки для локальных моделей
 #   ./install.sh --dir /opt/kb       — куда ставить
 #   ./install.sh --service           — зарегистрировать автозапуск
+#   ./install.sh --network           — открыть веб-интерфейс из сети (с паролем)
 #   ./install.sh --no-packages       — не ставить системные пакеты самому
 #   ./install.sh --dry-run           — показать, что будет сделано
 #
@@ -18,6 +19,7 @@ TARGET="${TARGET:-$HOME/$APP_NAME}"
 WITH_DOCKER=0
 WITH_GPU=0
 WITH_SERVICE=0
+WITH_NETWORK=0
 DRY_RUN=0
 # Ставить недостающие системные пакеты самим. Включено: строчку «а теперь
 # выполните вот эту команду» пропускают, и потом неделю выясняют, почему
@@ -53,7 +55,7 @@ HINT
 trap on_error ERR
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -62,6 +64,7 @@ while [ $# -gt 0 ]; do
     --docker) WITH_DOCKER=1 ;;
     --with-gpu) WITH_GPU=1 ;;
     --service) WITH_SERVICE=1 ;;
+    --network) WITH_NETWORK=1 ;;
     --no-packages) WITH_PACKAGES=0 ;;
     --dry-run) DRY_RUN=1 ;;
     --dir) shift; TARGET="${1:?после --dir нужен путь}" ;;
@@ -340,6 +343,30 @@ if [ ! -f "$TARGET/.env" ]; then
   run "cp '$TARGET/.env.example' '$TARGET/.env'"
   ok "Создан .env из образца"
 else ok ".env уже есть, не перезаписываю"; fi
+# В .env будет токен бота, в data/ — вопросы сотрудников: только владельцу.
+run "chmod 600 '$TARGET/.env' 2>/dev/null || true"
+run "chmod 700 '$TARGET/data' 2>/dev/null || true"
+
+if [ "$WITH_NETWORK" = 1 ]; then
+  # Доступ из сети. Наружу без пароля нельзя — админка управляет всей
+  # системой, поэтому пароль генерируется, если его ещё нет.
+  if grep -q "^ADMIN_HOST=0.0.0.0" "$TARGET/.env" 2>/dev/null; then
+    ok "Доступ из сети уже настроен"
+  else
+    run "printf '\n# Доступ из сети (добавлено установщиком по --network)\nADMIN_HOST=0.0.0.0\n' >> '$TARGET/.env'"
+  fi
+  if ! grep -q "^ADMIN_TOKEN=." "$TARGET/.env" 2>/dev/null; then
+    NEW_TOKEN="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    run "printf 'ADMIN_TOKEN=%s\n' '$NEW_TOKEN' >> '$TARGET/.env'"
+    ok "Пароль администратора создан: $NEW_TOKEN — сохраните его"
+  else
+    ok "Пароль администратора уже задан (ADMIN_TOKEN в .env)"
+  fi
+  LAN_IP=""
+  if [ "$PLATFORM" = macos ]; then LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  else LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"; fi
+  [ -n "$LAN_IP" ] && ok "Из сети: http://$LAN_IP:8800 (пароль — ADMIN_TOKEN)"
+fi
 
 # ------------------------------------------------------------- автозапуск --
 step "Проверка и автозапуск"
@@ -387,6 +414,35 @@ WantedBy=multi-user.target
 UNITEOF"
     run "sudo systemctl daemon-reload && sudo systemctl enable --now $APP_NAME"
     ok "Служба $APP_NAME запущена"
+    # Бот — отдельной службой с безусловным перезапуском. Убитый ночью
+    # OOM-киллером бот без Restart=always остаётся мёртвым до тех пор,
+    # пока сотрудники не пожалуются, — а админка при этом зелёная.
+    if grep -q "^TELEGRAM_BOT_TOKEN=." "$TARGET/.env" 2>/dev/null; then
+      BOT_UNIT=/etc/systemd/system/$APP_NAME-bot.service
+      run "sudo tee $BOT_UNIT >/dev/null <<BOTEOF
+[Unit]
+Description=Telegram-бот ассистента базы знаний
+After=network-online.target
+
+[Service]
+Type=simple
+User=$RUN_AS
+WorkingDirectory=$TARGET
+ExecStart=$VENV_PY $TARGET/bot.py
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+BOTEOF"
+      run "sudo systemctl daemon-reload && sudo systemctl enable --now $APP_NAME-bot"
+      ok "Служба $APP_NAME-bot запущена"
+    else
+      warn "Токен Telegram не задан — служба бота не создана. Задайте"
+      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку с --service снова."
+    fi
   elif [ "$PLATFORM" = macos ]; then
     PLIST="$HOME/Library/LaunchAgents/ru.company.$APP_NAME.plist"
     run "mkdir -p '$HOME/Library/LaunchAgents'"
@@ -406,6 +462,28 @@ PLISTEOF"
     run "launchctl unload '$PLIST' 2>/dev/null || true"
     run "launchctl load '$PLIST'"
     ok "Автозапуск настроен"
+    if grep -q "^TELEGRAM_BOT_TOKEN=." "$TARGET/.env" 2>/dev/null; then
+      BOT_PLIST="$HOME/Library/LaunchAgents/ru.company.$APP_NAME-bot.plist"
+      run "cat > '$BOT_PLIST' <<BOTPLISTEOF
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>ru.company.$APP_NAME-bot</string>
+  <key>ProgramArguments</key><array>
+    <string>$VENV_PY</string><string>$TARGET/bot.py</string></array>
+  <key>WorkingDirectory</key><string>$TARGET</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$TARGET/logs/bot-service.log</string>
+  <key>StandardErrorPath</key><string>$TARGET/logs/bot-service.log</string>
+</dict></plist>
+BOTPLISTEOF"
+      run "launchctl unload '$BOT_PLIST' 2>/dev/null || true"
+      run "launchctl load '$BOT_PLIST'"
+      ok "Автозапуск бота настроен"
+    else
+      warn "Токен Telegram не задан — автозапуск бота не настроен. Задайте"
+      echo "     TELEGRAM_BOT_TOKEN в .env и запустите установку с --service снова."
+    fi
   else
     warn "Автозапуск на этой системе не настроен — запускайте вручную"
   fi

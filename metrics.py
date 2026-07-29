@@ -66,6 +66,14 @@ def ensure_tables() -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_metrics_ts ON server_metrics(ts);
 
+    -- Пульс компонентов: бот и админка отмечаются, что живы. Проверка
+    -- оповещений сравнивает отметку с часами: процесс, который «активен»
+    -- для systemd, но завис или умер без службы, выдаёт себя молчанием.
+    CREATE TABLE IF NOT EXISTS heartbeats (
+        component TEXT PRIMARY KEY,
+        ts        TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS model_usage (
         id           INTEGER PRIMARY KEY,
         ts           TEXT,
@@ -182,6 +190,27 @@ def _procs() -> int:
         return len([p for p in Path("/proc").iterdir() if p.name.isdigit()])
     except Exception:  # noqa: BLE001
         return 0
+
+
+def beat(component: str) -> None:
+    """Отметка «я жив». Дёшево и не бросает исключений: пульс не должен
+    ронять то, за чем следит."""
+    try:
+        ensure_tables()
+        db.trun("INSERT OR REPLACE INTO heartbeats(component, ts) VALUES (?, ?)",
+                (component, _now()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def last_beat(component: str) -> str | None:
+    """Когда компонент отмечался в последний раз (ISO) либо None."""
+    try:
+        ensure_tables()
+        row = db.tq1("SELECT ts FROM heartbeats WHERE component=?", (component,))
+        return row["ts"] if row else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def collect() -> dict:

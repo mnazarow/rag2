@@ -203,10 +203,16 @@ def normalize_for_speech(text: str) -> str:
     text = re.sub(r"https?://\S+", " ссылка ", text)
 
     for unit, spoken in sorted(UNITS.items(), key=lambda x: -len(x[0])):
-        # Единица идёт после числа или пробела и заканчивается перед цифрой,
-        # знаком препинания или концом слова: «Ду50», «45 м,», «3,6 м³/ч».
-        text = re.sub(rf"(?<![А-Яа-яЁёA-Za-z]){re.escape(unit)}(?=[\s\d,.;:)!?]|$)",
-                      f" {spoken} ", text)
+        # Односимвольные единицы («В», «А», «м», «ч») раскрываются ТОЛЬКО
+        # после числа: иначе заглавная «В» в начале предложения читалась
+        # как «вольт» — стандартный отказ начинался со слов «вольт базе
+        # знаний…». Многосимвольные — после числа или пробела, как раньше.
+        if len(unit) == 1:
+            text = re.sub(rf"(?<=\d)\s?{re.escape(unit)}(?=[\s,.;:)!?]|$)",
+                          f" {spoken} ", text)
+        else:
+            text = re.sub(rf"(?<![А-Яа-яЁёA-Za-z]){re.escape(unit)}(?=[\s\d,.;:)!?]|$)",
+                          f" {spoken} ", text)
     for abbr, spoken in ABBR.items():
         text = re.sub(rf"\b{re.escape(abbr)}\b", spoken, text)
 

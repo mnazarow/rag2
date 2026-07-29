@@ -109,6 +109,14 @@ case "$MODE" in
     say "Возвращаю версию из $LAST"
     [ -f "$LAST/code.tar.gz" ] && tar -xzf "$LAST/code.tar.gz" -C "$TARGET"
     [ -f "$LAST/.env" ] && cp "$LAST/.env" "$TARGET/.env"
+    ok "Код и настройки возвращены."
+    # Код откатился, а схема базы — нет: обновление могло мигрировать её
+    # вперёд, и старый код упадёт не сейчас, а на первом обращении к
+    # изменённой таблице. Честно предупреждаем и показываем выход.
+    warn "База данных НЕ откатывается автоматически: если обновление меняло"
+    echo "     схему, восстановите снимок данных из этой же папки:"
+    echo "     $TARGET/venv/bin/python $TARGET/backup.py restore --latest"
+    echo "     (текущие данные перед этим сохранит: backup.py create)"
     ok "Откат выполнен. Перезапустите сервисы."
     exit 0 ;;
 esac
@@ -120,8 +128,21 @@ if command -v systemctl >/dev/null 2>&1 \
    && systemctl is-active --quiet kb-assistant 2>/dev/null; then
   sudo systemctl stop kb-assistant && ok "systemd остановлен"
 fi
-pkill -f "$TARGET/webui.py" 2>/dev/null && ok "админка остановлена" || true
-pkill -f "$TARGET/bot.py" 2>/dev/null && ok "бот остановлен" || true
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl is-active --quiet kb-assistant-bot 2>/dev/null; then
+  sudo systemctl stop kb-assistant-bot && ok "служба бота остановлена"
+fi
+pkill -f "$TARGET/webui.py" 2>/dev/null && ok "админка останавливается" || true
+pkill -f "$TARGET/bot.py" 2>/dev/null && ok "бот останавливается" || true
+# Ждём настоящего завершения. Служба получает на остановку 40 секунд —
+# чтобы дописать файл векторов; pkill без ожидания переписывал код прямо
+# под процессом, который ещё дописывал индекс.
+WAITED=0
+while pgrep -f "$TARGET/webui.py|$TARGET/bot.py" >/dev/null 2>&1; do
+  [ "$WAITED" -ge 45 ] && { warn "процессы не остановились за 45 с — продолжаю"; break; }
+  sleep 1; WAITED=$((WAITED+1))
+done
+[ "$WAITED" -gt 0 ] && ok "процессы завершились за $WAITED с"
 
 say "Обновляю код"
 printf "  установка: %s\n" "$TARGET"

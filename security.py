@@ -174,6 +174,17 @@ def secrets_health() -> dict:
         if path.stat().st_mode & 0o077:
             problems.append(f"файл ключей доступен не только владельцу ({mode}). "
                             f"Исправьте: chmod 600 {path}")
+    # Те же требования — к .env с токеном бота и к папке данных с
+    # вопросами сотрудников: они не менее секретны, чем файл ключей.
+    for label, target, fix in ((".env", env_file, "chmod 600"),
+                               ("папка данных", config.DATA_DIR, "chmod 700")):
+        try:
+            if Path(target).exists() and Path(target).stat().st_mode & 0o077:
+                problems.append(
+                    f"{label} доступна не только владельцу. "
+                    f"Исправьте: {fix} {target}")
+        except OSError:
+            pass
     return {"file": str(path), "exists": path.exists(), "mode": mode,
             "external": bool(config.SECRETS_CMD), "in_env": in_env,
             "ok": not problems, "problems": problems}
@@ -479,7 +490,12 @@ def check_answer_leak(text: str, hits: list, allowed_sections: set[str] | None,
     был ловить утечку «любым способом», не видел ровно того канала, где
     лежит самое закрытое: цены.
     """
-    if not config.PROMPT_GUARD or not allowed_sections:
+    # None означает «роли видят всё» — проверять нечего. А вот ПУСТОЕ
+    # множество — это роль, не описанная в разграничении: самый закрытый
+    # режим. Раньше `not allowed_sections` выключал проверку именно для
+    # него — второй контур защиты не работал ровно там, где нужен больше
+    # всего.
+    if not config.PROMPT_GUARD or allowed_sections is None:
         return {"leak": False, "sections": []}
     bad = {h.section for h in (hits or [])
            if getattr(h, "section", None) and h.section not in allowed_sections}

@@ -255,19 +255,44 @@ class _Instrumented:
         self.name = inner.name
         self.model = inner.model
 
+    @staticmethod
+    def _transient(exc: Exception) -> bool:
+        """Стоит ли повторить: перегрузка и сетевые сбои проходят сами."""
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+        text = str(exc).lower()
+        return any(w in text for w in ("timeout", "timed out", "connection",
+                                       "пустой ответ"))
+
     def complete(self, system: str, user: str) -> LLMResponse:
         import metrics
-        started = time.time()
-        try:
-            res = self._inner.complete(system, user)
-            metrics.record_model_call(res.model or self.model, self.name, "llm",
-                                      res.tokens_in, res.tokens_out,
-                                      int((time.time() - started) * 1000), True)
-            return res
-        except Exception as exc:
-            metrics.record_model_call(self.model, self.name, "llm", 0, 0,
-                                      int((time.time() - started) * 1000), False, str(exc))
-            raise
+        for attempt in range(3):
+            started = time.time()
+            try:
+                res = self._inner.complete(system, user)
+                # content может быть None: облачные шлюзы возвращают его
+                # при срабатывании своих фильтров. Раньше это давало
+                # AttributeError и «Модель недоступна» без объяснений.
+                if not (res.text or "").strip():
+                    raise LLMError("модель вернула пустой ответ")
+                metrics.record_model_call(res.model or self.model, self.name, "llm",
+                                          res.tokens_in, res.tokens_out,
+                                          int((time.time() - started) * 1000), True)
+                return res
+            except Exception as exc:
+                metrics.record_model_call(self.model, self.name, "llm", 0, 0,
+                                          int((time.time() - started) * 1000),
+                                          False, str(exc))
+                # Транзиентное (429, 5xx, сеть, пустой ответ) — повторяем
+                # с паузой; остальное сразу наверх, к запасному провайдеру.
+                if attempt < 2 and self._transient(exc):
+                    log.warning("повтор %d после сбоя «%s» у %s",
+                                attempt + 1, exc, self.name)
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise
+        raise LLMError("необъяснимый выход из цикла повторов")
 
 
 class Routed:

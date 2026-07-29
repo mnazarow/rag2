@@ -87,6 +87,9 @@ def _drop_document(doc_id: int) -> None:
     conn.commit()
 
 
+_last_vec_save = 0.0
+
+
 def index_file(path: Path, force: bool = False, verbose: bool = False) -> str:
     """Возвращает: indexed | unchanged | skipped | error."""
     try:
@@ -295,7 +298,13 @@ def build(force: bool = False, limit: int | None = None, verbose: bool = False,
                  f"обработано {i} из {total}", i, total)
             emit("embed", "running" if i < total else "ok",
                  f"векторов: {len(db.vectors())}", len(db.vectors()), 0)
-            db.vectors().save()          # чтобы обрыв индексации не стоил всей работы
+            # Сохранение — по времени, а не по числу файлов. Матрица
+            # пишется на диск целиком: на большой базе сохранение каждые
+            # 25 файлов означало терабайты записи и «зависшую» индексацию.
+            global _last_vec_save
+            if time.time() - _last_vec_save > 120:
+                db.vectors().save()      # чтобы обрыв индексации не стоил всей работы
+                _last_vec_save = time.time()
             done = time.time() - started
             rate = i / max(done, 0.01)
             eta = (total - i) / max(rate, 0.01)
@@ -460,6 +469,7 @@ def reembed(provider: str | None = None, batch: int = 256,
         store.ids = []
         store.matrix = np.zeros((0, info["dim"] or config.EMBEDDINGS_DIM), dtype=np.float32)
         store._index = {}
+        store._pending = []
         ids = [r["id"] for r in db.q(
             "SELECT c.id FROM chunks c JOIN documents d ON d.id=c.doc_id "
             "WHERE d.status='ok' ORDER BY c.id")]
@@ -480,7 +490,10 @@ def reembed(provider: str | None = None, batch: int = 256,
         store.add([r["id"] for r in rows], embeddings.embed_texts(texts))
         done += len(rows)
         if start % (batch * 8) == 0 or done == len(ids):
-            store.save()
+            global _last_vec_save
+            if time.time() - _last_vec_save > 120 or done == len(ids):
+                store.save()
+                _last_vec_save = time.time()
             speed = done / max(time.time() - started, 1e-6)
             left = (len(ids) - done) / max(speed, 1e-6)
             say(f"{done}/{len(ids)}  ~{speed:.0f} фрагм./с, "

@@ -62,6 +62,10 @@ class Answer:
     hits: list = field(default_factory=list)
     products: list = field(default_factory=list)
     answered: bool = True
+    # Нумерованные источники в том порядке, в котором они пронумерованы
+    # в контексте модели: сначала прайсы, затем документы. Именно этот
+    # список показывается пользователю под ответом.
+    sources: list = field(default_factory=list)
     query_id: int | None = None
     confidence: float = 0.0
     latency_ms: int = 0
@@ -79,9 +83,55 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def build_context(hits: list[search_mod.Hit]) -> str:
+def price_context(product_rows: list[dict], start: int = 1,
+                  ) -> tuple[str, list[dict], int]:
+    """
+    Блок прайса как нумерованный источник.
+
+    Раньше цены вставлялись в контекст безымянным блоком, а промпт
+    требовал ставить [n] после каждого утверждения — модели приходилось
+    выбирать номер, и цена уходила со ссылкой на первый документ. Сотрудник
+    открывал паспорт насоса и цены там не находил. Теперь каждый файл
+    прайса получает свой номер, и ссылка ведёт туда, откуда цифра.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in product_rows:
+        groups.setdefault(row.get("rel_path") or "", []).append(row)
+    blocks, sources = [], []
+    n = start
+    for rel, rows in groups.items():
+        first = rows[0]
+        fname = first.get("file_name") or rel or "прайс-лист"
+        pdate = first.get("price_date") or ""
+        head = f"[{n}] прайс-лист «{fname}»"
+        if pdate:
+            head += f", от {pdate}"
+        head += " — точные данные из таблицы, приоритет над остальными фрагментами"
+        blocks.append(head + "\n" + prices.format_products(rows))
+        sources.append({"n": n, "kind": "price", "file_name": fname,
+                        "rel_path": rel, "date": pdate, "is_current": 1,
+                        "page": None})
+        n += 1
+    return "\n\n".join(blocks), sources, n
+
+
+def build_context(hits: list[search_mod.Hit], start: int = 1) -> str:
+    """
+    Контекст для модели — с бюджетом и без дублей.
+
+    Бюджет: маленькие модели (8k окна) получали до 17 тысяч символов и
+    отвечали кодом 400, который снаружи выглядел как «модель недоступна».
+    Дубли: перекрывающиеся чанки и один документ в двух разделах читались
+    моделью как независимые подтверждения одного и того же.
+    """
     blocks = []
-    for i, h in enumerate(hits, start=1):
+    budget = config.CONTEXT_MAX_CHARS
+    seen_texts: list[str] = []
+    for i, h in enumerate(hits, start=start):
+        norm = " ".join(h.text.split())[:400]
+        if any(norm and (norm in prev or prev in norm) for prev in seen_texts):
+            continue
+        seen_texts.append(norm)
         header = f"[{i}] {h.file_name}"
         extras = []
         if h.brand:
@@ -96,8 +146,61 @@ def build_context(hits: list[search_mod.Hit]) -> str:
             header += " (" + ", ".join(extras) + ")"
         if h.heading:
             header += f" — раздел «{h.heading}»"
-        blocks.append(f"{header}\n{h.text}")
+        block = f"{header}\n{h.text}"
+        if blocks and sum(len(b) for b in blocks) + len(block) > budget:
+            break
+        blocks.append(block)
     return "\n\n".join(blocks)
+
+
+def verify_answer(text: str, n_sources: int, context: str) -> tuple[str, dict]:
+    """
+    Проверка ответа модели по результату: ссылки и числа.
+
+    Ссылки: номер [7] при трёх источниках — реальный случай, модель
+    охотно продолжает нумерацию. Битые ссылки убираются из текста.
+
+    Числа: правило «переноси дословно» ничем не подкреплено, а ошибка в
+    цифре на технической базе дороже любой стилистики. Числа ответа,
+    которых нет в контексте, не удаляются (модель могла законно сложить
+    или пересчитать), но помечаются — и для читателя, и в журнале.
+    """
+    import normtext
+    report = {"bad_refs": [], "unsupported_numbers": []}
+    if not text.strip():
+        return text, report
+
+    def _fix_ref(m):
+        n = int(m.group(1))
+        if 1 <= n <= n_sources:
+            return m.group(0)
+        report["bad_refs"].append(n)
+        return ""
+
+    text = re.sub(r"\[(\d{1,3})\]", _fix_ref, text)
+
+    def _numbers(raw: str) -> set[str]:
+        cleaned = re.sub(r"(?<=\d)[\s  ](?=\d)", "", normtext.canon(raw))
+        found = set(re.findall(r"\d+(?:\.\d+)?", cleaned))
+        # «18400.00» подтверждает и «18400»: целая часть — то же число.
+        for n in list(found):
+            if "." in n:
+                found.add(n.split(".", 1)[0])
+                found.add(n.rstrip("0").rstrip("."))
+        return found
+
+    ctx_numbers = _numbers(context)
+    body = re.sub(r"\[\d{1,3}\]", "", text)
+    for num in _numbers(body):
+        if len(num) < 2 and "." not in num:
+            continue                      # одиночная цифра — обычно нумерация
+        if num not in ctx_numbers:
+            report["unsupported_numbers"].append(num)
+    if report["unsupported_numbers"]:
+        nums = ", ".join(sorted(report["unsupported_numbers"])[:5])
+        text += ("\n\n⚠ Числа " + nums + " не найдены в приведённых "
+                 "фрагментах — сверьтесь с первоисточником.")
+    return text, report
 
 
 def ask(question: str, user_id: int | None = None, user_name: str | None = None,
@@ -126,9 +229,14 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
     # вопрос дилера и о разграничении не думал. Канал этот идёт первым и
     # раньше проверок не проходил вовсе, то есть был самым коротким путём
     # к утечке.
-    golden = search_mod.golden_search(question, limit=1, role=role)
-    if golden and _golden_is_close(question, golden[0]["question"]):
-        g = golden[0]
+    # Кандидатов берём несколько: топ-1 по BM25 может не пройти порог
+    # сходства, а дословно совпадающий эталон — стоять вторым.
+    golden = search_mod.golden_search(question, limit=5, role=role)
+    best = max(golden,
+               key=lambda g: _golden_similarity(question, g["question"]),
+               default=None)
+    if best and _golden_is_close(question, best["question"]):
+        g = best
         db.run("UPDATE golden_qa SET hits=hits+1 WHERE id=?", (g["id"],))
         ans = Answer(text=g["answer"] + "\n\n_Ответ выверен экспертом._",
                      answered=True, used_golden=True, route="golden",
@@ -171,10 +279,27 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
             _trace(question, ans, "", user_id, user_name, role, started)
         return ans
 
-    context = build_context(hits)
+    # Ценовой вопрос раньше отключал порог целиком: при найденной позиции
+    # прайса в контекст шли и документные фрагменты любой степени
+    # случайности — и модель дописывала к цене «напор 60 м [3]» из чужого
+    # паспорта. Теперь порог применяется к документам всегда: цена без
+    # подтверждённых фрагментов идёт одна, без случайного сопровождения.
+    if product_rows and conf < config.MIN_CONFIDENCE:
+        hits = []
+
+    # Прайс — нумерованный источник наравне с документами: цена в ответе
+    # ссылается на файл прайса, а не на случайно выбранный документ.
+    price_block, price_sources, next_n = ("", [], 1)
     if product_rows:
-        context = ("[ПРАЙС-ЛИСТ — точные данные из таблицы, приоритет над остальным]\n"
-                   + prices.format_products(product_rows) + "\n\n" + context)
+        price_block, price_sources, next_n = price_context(product_rows, start=1)
+    context = build_context(hits, start=next_n)
+    if price_block:
+        context = price_block + "\n\n" + context if context else price_block
+    doc_sources = [{"n": next_n + i, "kind": "document", "file_name": h.file_name,
+                    "rel_path": h.rel_path, "date": h.effective_date,
+                    "is_current": h.is_current, "page": h.page_from}
+                   for i, h in enumerate(hits)]
+    sources = price_sources + doc_sources
 
     engine = llm_mod.get_llm()
     _t = time.time()
@@ -189,19 +314,34 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
         text = resp.text.strip()
         tokens_in, tokens_out, model = resp.tokens_in, resp.tokens_out, resp.model
         metrics.record_stage("генерация", int((time.time() - _t) * 1000))
+        stage = "answered"
+        text, verify_report = verify_answer(text, len(sources), context)
+        if verify_report["bad_refs"] or verify_report["unsupported_numbers"]:
+            logger.warning("проверка ответа: битые ссылки %s, "
+                           "неподтверждённые числа %s",
+                           verify_report["bad_refs"],
+                           verify_report["unsupported_numbers"])
     except llm_mod.LLMBusy as exc:
         # Очередь переполнена. Показать фрагменты честнее, чем молчать:
         # человек хотя бы увидит, где ответ, пока модель занята.
         logger.warning("отказ по очереди к модели: %s", exc)
         text = (f"{exc}\n\nПока модель занята, вот наиболее подходящие фрагменты базы:\n\n"
-                + "\n\n".join(f"[{i}] {h.text[:400]}" for i, h in enumerate(hits[:3], 1)))
+                + "\n\n".join(f"[{i}] {h.text[:400]}"
+                              for i, h in enumerate(hits[:3], next_n)))
         tokens_in = tokens_out = 0
         model = "queue-busy"
+        stage = "llm_busy"
     except Exception as exc:  # noqa: BLE001
+        # Текст ошибки маскируется: в нём бывает base_url с паролем АТС
+        # или ключом провайдера — журналы это маскируют, и исходящие
+        # сообщения обязаны не хуже.
+        exc = logging_setup.mask(str(exc))
         text = (f"Модель недоступна ({exc}). Вот наиболее подходящие фрагменты базы:\n\n"
-                + "\n\n".join(f"[{i}] {h.text[:400]}" for i, h in enumerate(hits[:3], 1)))
+                + "\n\n".join(f"[{i}] {h.text[:400]}"
+                              for i, h in enumerate(hits[:3], next_n)))
         tokens_in = tokens_out = 0
         model = "fallback"
+        stage = "llm_failed"
 
     # Последняя проверка — по результату, а не по формулировке вопроса:
     # она ловит утечку из недоступного раздела независимо от того, каким
@@ -212,28 +352,98 @@ def ask(question: str, user_id: int | None = None, user_name: str | None = None,
         logger.error("ответ содержал фрагменты из недоступных роли «%s» разделов: "
                      "%s — выдача заменена отказом", role, leak["sections"])
         text = security.SAFE_REFUSAL
+        # Чистится всё, а не только текст: артикулы и цены из закрытого
+        # раздела иначе оставались в products и печатались потребителями
+        # объекта Answer прямо под текстом отказа.
         hits = []
+        product_rows = []
+        sources = []
 
-    ans = Answer(text=text, hits=hits, products=product_rows, answered=True,
+    # Фрагменты вместо ответа — не ответ: воронка и метрика answered
+    # раньше считали эти случаи успехом, и сбой модели неделями выглядел
+    # как нормальная работа.
+    ans = Answer(text=text, hits=hits, products=product_rows,
+                 answered=(stage == "answered"),
+                 sources=sources,
                  confidence=conf, latency_ms=int((time.time() - started) * 1000),
                  llm_model=model,
-                 route="price" if product_rows else "documents", stage="answered",
+                 route="price" if product_rows else "documents", stage=stage,
                  channels=_channels_of(hits), n_candidates=len(hits),
                  rerank_used=any(h.channels.get("rerank") is not None for h in hits))
     if log:
         ans.query_id = _log_query(question, ans, user_id, user_name, role, chat_id,
                                   tokens_in, tokens_out)
-        _trace(question, ans, context, user_id, user_name, role, started)
+        # В трассировку идёт вопрос в том виде, в каком его видела модель
+        # (после обезвреживания) — иначе разбор жалобы смотрит не на то.
+        _trace(prompt_question, ans, context, user_id, user_name, role, started)
     return ans
 
 
-def _golden_is_close(question: str, golden_question: str, threshold: float = 0.6) -> bool:
-    """Простое пересечение токенов: не выдаём выверенный ответ на другой вопрос."""
+# Подпись модели: числа с разделителями («55/75», «0,5-40», «500036.F»).
+# Именно этими токенами различаются соседние модели, и именно их
+# выбрасывало старое сравнение по словам от трёх символов — из-за чего
+# «напор Водомет 60/92» получал выверенный ответ про 55/75 со стопроцентным
+# сходством. Ответ, помеченный «выверен экспертом», доверием пользуется
+# безоговорочным, поэтому ошибка здесь дороже любого промаха поиска.
+_SIGNATURE_RX = re.compile(r"\d+(?:[.,/\-хx×]\d+)*(?:\.[a-zа-я]{1,3})?", re.IGNORECASE)
+
+_brand_cache: set[str] | None = None
+
+
+def _signatures(text: str) -> set[str]:
+    """Числовые подписи моделей в едином написании."""
+    out = set()
+    for m in _SIGNATURE_RX.findall(text.lower()):
+        out.add(m.replace(",", ".").replace("х", "x").replace("×", "x"))
+    return out
+
+
+def _known_brands() -> set[str]:
+    """Бренды из проиндексированной базы; кэш на процесс."""
+    global _brand_cache
+    if _brand_cache is None:
+        try:
+            rows = db.q("SELECT DISTINCT brand FROM documents "
+                        "WHERE brand IS NOT NULL AND brand != ''")
+            _brand_cache = {r["brand"].lower() for r in rows}
+        except Exception:  # noqa: BLE001
+            _brand_cache = set()
+    return _brand_cache
+
+
+def _brands_in(text: str) -> set[str]:
+    words = set(re.findall(r"[\wа-яё]+", text.lower()))
+    return words & _known_brands()
+
+
+def _golden_similarity(question: str, golden_question: str) -> float:
+    """
+    Сходство вопроса с эталонным: 0 — точно не тот вопрос.
+
+    Три ступени, от жёсткой к мягкой. Подписи моделей обязаны совпасть
+    как множества: вопрос про 60/92 не имеет права получить ответ про
+    55/75, каким бы похожим ни был остальной текст. Бренды — то же
+    самое: «гарантия на Джилекс» и «гарантия на Вило» различаются одним
+    словом, но ответы у них разные. И только после этого сравниваются
+    слова — с порогом, который проверяет уже сам вызывающий код.
+    """
+    sig_a, sig_b = _signatures(question), _signatures(golden_question)
+    if (sig_a or sig_b) and sig_a != sig_b:
+        return 0.0
+    br_a, br_b = _brands_in(question), _brands_in(golden_question)
+    if (br_a or br_b) and br_a != br_b:
+        return 0.0
     a = set(re.findall(r"[\wа-яё]{3,}", question.lower()))
     b = set(re.findall(r"[\wа-яё]{3,}", golden_question.lower()))
     if not a or not b:
-        return False
-    return len(a & b) / len(a | b) >= threshold
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _golden_is_close(question: str, golden_question: str,
+                     threshold: float = 0.75) -> bool:
+    """Не выдаём выверенный ответ на другой вопрос."""
+    return _golden_similarity(question, golden_question) >= threshold
 
 
 def _trace(question, ans, context, user_id, user_name, role, started) -> None:

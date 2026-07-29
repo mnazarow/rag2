@@ -75,6 +75,20 @@ def check(role: str = "процесс") -> dict:
     elif writable and free_gb < 10:
         warn.append(f"на диске с данными свободно всего {free_gb:.1f} ГБ")
 
+    # --- копии на том же устройстве, что и данные ---
+    # Отказ диска в этой конфигурации уносит и данные, и все копии разом:
+    # именно то, от чего копии должны были защищать.
+    try:
+        if not config.BACKUP_MIRROR_DIR:
+            backup_dir = Path(config.BACKUP_DIR)
+            if (backup_dir.exists() and writable
+                    and backup_dir.stat().st_dev == Path(config.DATA_DIR).stat().st_dev):
+                warn.append("резервные копии лежат на том же диске, что и данные "
+                            "(BACKUP_MIRROR_DIR не задан) — отказ диска унесёт "
+                            "и то и другое; укажите зеркало на другом носителе")
+    except OSError:
+        pass
+
     # --- база знаний ---
     if role in ("админка", "индексация", "бот"):
         if not Path(config.KB_ROOT).exists():

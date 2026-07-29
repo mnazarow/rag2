@@ -19,6 +19,7 @@ import config
 import db
 import embeddings
 import logging_setup
+import normtext
 import rerank as reranker
 
 log = logging_setup.get("search")
@@ -40,6 +41,12 @@ class Hit:
     is_current: int
     page_from: int | None
     score: float = 0.0
+    # Интерпретируемая релевантность 0…1: покрытие значимых слов запроса
+    # (см. rerank.relevance). Именно с ней сравнивается MIN_CONFIDENCE.
+    # Ранговый score из RRF для порога не годится: он зависит только от
+    # места в списке, и «лучший из мусора» получает те же ~0.014, что и
+    # точное попадание, — порог отказа не срабатывал никогда.
+    relevance: float = 0.0
     channels: dict = field(default_factory=dict)
 
     @property
@@ -56,19 +63,86 @@ class Hit:
 _STOP = {"как", "что", "где", "для", "или", "это", "the", "and", "при", "под", "над",
          "чем", "кто", "быть", "если", "так", "уже", "его", "нам", "мне", "она", "они"}
 
+# Синонимы предметной области. В вопросе пишут «производительность», в
+# паспорте — «подача»: LSA связывает слова, только если они совместно
+# встречаются в базе, а эти пары в одном документе почти не встречаются.
+# Разворот делается на стороне ЗАПРОСА: индекс не трогается, а значит
+# словарь можно править без пересборки. Сюда же — транслит брендов:
+# «grundfos» в вопросе и «Грундфос» на русскоязычной странице паспорта.
+SYNONYMS: dict[str, list[str]] = {
+    "производительность": ["подача", "расход"],
+    "подача": ["производительность", "расход"],
+    "расход": ["подача", "производительность"],
+    "давление": ["напор"],
+    "напор": ["давление"],
+    "глубина": ["погружение"],
+    "высота": ["напор"],
+    "мощность": ["ватт", "квт"],
+    "вес": ["масса"],
+    "масса": ["вес"],
+    "срок": ["гарантия", "ресурс"],
+    "ресурс": ["срок", "наработка"],
+    "шум": ["вибрация"],
+    "цена": ["стоимость"],
+    "стоимость": ["цена"],
+    "скважина": ["скважинный"],
+    "колодец": ["колодезный"],
+    "grundfos": ["грундфос"],
+    "грундфос": ["grundfos"],
+    "wilo": ["вило"],
+    "вило": ["wilo"],
+    "unipump": ["юнипамп"],
+    "юнипамп": ["unipump"],
+    "belamos": ["беламос"],
+    "беламос": ["belamos"],
+    "aquastrong": ["аквастронг"],
+    "аквастронг": ["aquastrong"],
+    "джилекс": ["jeelex", "vodomet"],
+    "jeelex": ["джилекс"],
+    "водомет": ["vodomet"],
+    "vodomet": ["водомет"],
+}
+
+
+def expand_synonyms(tokens: list[str]) -> list[str]:
+    """Синонимы к токенам запроса — без дублей, в порядке появления."""
+    out: list[str] = []
+    for t in tokens:
+        for syn in SYNONYMS.get(t, []):
+            if syn not in tokens and syn not in out:
+                out.append(syn)
+    return out
+
 
 def _fts_query(text: str) -> str:
     """Готовит запрос для FTS5: OR по значимым токенам + префиксный поиск."""
-    tokens = re.findall(r"[\wА-Яа-яЁё\-./]{2,}", text.lower())
-    tokens = [t.strip("-./") for t in tokens if t not in _STOP and len(t) > 2]
+    text = normtext.canon(text)
+    raw = re.findall(r"[\wА-Яа-яЁё\-./]{2,}", text.lower())
+    # Числа из одной-двух цифр и дроби — значимая часть вопроса («напор
+    # 45 м», «подача 3.6»), их нельзя выбрасывать вместе с предлогами.
+    tokens = [t.strip("-./") for t in raw
+              if t not in _STOP
+              and (len(t) > 2 or re.fullmatch(r"\d+(?:\.\d+)?", t))]
+    tokens = [t for t in tokens if t]
     if not tokens:
         return ""
     parts = []
-    for t in tokens[:16]:
+    for t in tokens[:16] + expand_synonyms(tokens[:16])[:8]:
         safe = t.replace('"', "")
         parts.append(f'"{safe}"')
         if len(safe) > 4 and safe.isalpha():
             parts.append(f'"{safe}"*')
+            # Префикс от ОСНОВЫ слова, а не от словоформы: «насосов» не
+            # находится по «насосов»*, а «насос»* находит и «насосов»,
+            # и «насосы», и «насосом». BM25 сам морфологии не знает —
+            # это единственное место, где она у него появляется.
+            try:
+                import lsa
+                stem = lsa.normalize_token(safe)
+                if stem != safe and len(stem) > 3:
+                    parts.append(f'"{stem}"*')
+            except Exception:  # noqa: BLE001
+                pass
     return " OR ".join(parts)
 
 
@@ -223,8 +297,29 @@ def search(query: str, top_k: int | None = None, role: str | None = None,
     top_k = top_k or config.SEARCH_TOP_K
     n = config.SEARCH_CANDIDATES
 
+    # Смешанная раскладка в вопросе — «джилeкс» с латинской «e» —
+    # чинится тем же ремонтом гомоглифов, что и распознанные сканы.
+    # Документы этим обрабатываются при индексации, вопросы — здесь.
+    try:
+        import ocr
+        repaired, report = ocr.repair_homoglyphs(query)
+        if report.get("repaired"):
+            log.debug("вопрос содержал смешанную раскладку, починено: %s → %s",
+                      query, repaired)
+            query = repaired
+    except Exception:  # noqa: BLE001 — ремонт не должен ронять поиск
+        pass
+
     lexical = bm25_search(query, n)
-    dense = dense_search(query, n)
+    # Смысловой канал получает вопрос, расширенный синонимами: «какая
+    # производительность» без слова «подача» может не найти паспорт,
+    # где написано только «подача, м3/ч».
+    dense_query = query
+    q_tokens = re.findall(r"[\wа-яё]+", normtext.canon(query).lower())
+    extra = expand_synonyms(q_tokens)
+    if extra:
+        dense_query = query + " " + " ".join(extra)
+    dense = dense_search(dense_query, n)
 
     fused: dict[int, float] = {}
     for cid, s in _rrf(lexical, config.RRF_K).items():
@@ -277,7 +372,18 @@ def search(query: str, top_k: int | None = None, role: str | None = None,
 
     hits.sort(key=lambda h: -h.score)
     hits = rerank(query, hits)
-    return _dedupe_by_document(hits, top_k)
+    hits = _dedupe_by_document(hits, top_k)
+
+    # Релевантность для порога отказа — по итоговой выдаче, той самой,
+    # которая уйдёт в модель. Считается лексически и всегда, независимо
+    # от провайдера переранжирования: шкала MIN_CONFIDENCE стабильна.
+    if hits:
+        texts = ["\n".join(p for p in (h.context, h.heading, h.text) if p)
+                 for h in hits]
+        for h, rel in zip(hits, reranker.relevance(query, texts)):
+            h.relevance = float(rel)
+            h.channels["relevance"] = round(float(rel), 4)
+    return hits
 
 
 def _dedupe_by_document(hits: list[Hit], top_k: int, per_doc: int = 2) -> list[Hit]:
@@ -333,4 +439,14 @@ def rerank(query: str, hits: list[Hit]) -> list[Hit]:
 
 
 def confidence(hits: list[Hit]) -> float:
-    return hits[0].score if hits else 0.0
+    """
+    Уверенность 0…1, с которой сравнивается MIN_CONFIDENCE.
+
+    Берётся лучшая релевантность по всей выдаче, а не только по первому
+    месту: первый элемент мог подняться за счёт свежести, а точное
+    совпадение слов стоять вторым. Раньше здесь возвращался ранговый
+    RRF-скор — и порог отказа был недостижим математически: минимум
+    для первого места (0.0139) выше порога по умолчанию (0.012). Ветка
+    «в базе знаний нет данных» не срабатывала никогда.
+    """
+    return max((h.relevance for h in hits), default=0.0)
