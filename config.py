@@ -20,6 +20,19 @@ BASE_DIR = Path(__file__).resolve().parent
 # Список хранится в самом окружении, а не в переменной модуля, потому что
 # при сохранении настроек модуль перечитывается целиком: обычная
 # переменная обнулилась бы, и различать стало бы нечем.
+# Службы macOS (launchd) получают PATH без каталогов Homebrew, и всё,
+# что стоит через brew — ollama, ffmpeg, tesseract, poppler, — для них
+# «не установлено», хотя из терминала прекрасно видно. Одна и та же
+# админка из терминала и из автозапуска вела себя по-разному, и
+# предупреждение «нет ollama» при стоящем ollama — ровно отсюда.
+# Дополняем PATH здесь, потому что config импортируется первым и все
+# проверки через shutil.which после этого честны в обоих режимах.
+import platform as _platform
+if _platform.system() == "Darwin":
+    for _extra in ("/opt/homebrew/bin", "/usr/local/bin"):
+        if os.path.isdir(_extra) and _extra not in os.environ.get("PATH", "").split(":"):
+            os.environ["PATH"] = os.environ.get("PATH", "") + ":" + _extra
+
 _MARKER = "_KB_KEYS_FROM_DOTENV"
 
 

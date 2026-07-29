@@ -228,3 +228,31 @@ class TestMacModelSupport(Isolated):
             chk = models.check("t-pro-2.0")
         self.assertFalse(chk["ok"])
         self.assertTrue(any("ollama" in p for p in chk["problems"]), chk["problems"])
+
+    def test_brew_paths_added_on_mac(self):
+        """
+        Службы launchd живут с урезанным PATH без каталогов Homebrew —
+        для них ollama и ffmpeg «не установлены», хотя стоят. config
+        обязан дополнять PATH на маке, иначе кнопка «Проверить» в
+        разделе моделей врёт ровно тогда, когда админка запущена как
+        служба — то есть в проде.
+        """
+        import importlib
+        import os
+        import platform
+        from unittest import mock
+
+        saved = os.environ["PATH"]
+        os.environ["PATH"] = "/usr/bin:/bin"
+        try:
+            with mock.patch.object(platform, "system", return_value="Darwin"), \
+                 mock.patch("os.path.isdir",
+                            lambda d: d in ("/opt/homebrew/bin", "/usr/local/bin")
+                            or os.path.exists(d)):
+                import config
+                importlib.reload(config)
+            self.assertIn("/opt/homebrew/bin", os.environ["PATH"])
+        finally:
+            os.environ["PATH"] = saved
+            import config
+            importlib.reload(config)

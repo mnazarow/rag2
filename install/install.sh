@@ -506,6 +506,10 @@ BOTEOF"
   <key>ProgramArguments</key><array>
     <string>$VENV_PY</string><string>$TARGET/webui.py</string></array>
   <key>WorkingDirectory</key><string>$TARGET</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$TARGET/logs/service.log</string>
   <key>StandardErrorPath</key><string>$TARGET/logs/service.log</string>
@@ -524,6 +528,10 @@ PLISTEOF"
   <key>ProgramArguments</key><array>
     <string>$VENV_PY</string><string>$TARGET/bot.py</string></array>
   <key>WorkingDirectory</key><string>$TARGET</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$TARGET/logs/bot-service.log</string>
   <key>StandardErrorPath</key><string>$TARGET/logs/bot-service.log</string>
