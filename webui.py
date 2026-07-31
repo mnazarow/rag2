@@ -670,6 +670,7 @@ svg{display:block;width:100%}
  <button data-t="flow">Конвейер</button>
  <button data-t="models">Модели</button>
  <button data-t="kb">База знаний</button>
+ <button data-t="organize">Порядок в базе</button>
  <button data-t="search">Качество поиска</button>
  <button data-t="eval">Контрольные вопросы</button>
  <button data-t="ocr">Сканы</button>
@@ -872,6 +873,58 @@ svg{display:block;width:100%}
 </section>
 
 <!-- ═══════════════════════════════════ качество поиска ═══════════════════ -->
+<section id="organize">
+  <h2>Порядок в базе знаний</h2>
+  <p class="muted">Структура папок — это метаданные: раздел определяет права
+    доступа, бренд попадает в карточку каждого фрагмента, папка типа задаёт
+    маршрут документа, дата в имени управляет вытеснением версий. Здесь видно,
+    где база отступает от этих правил, и собирается план уборки. Сама папка
+    базы знаний подключена только на чтение — план выполняет человек.
+    Пошаговый алгоритм — в документации, раздел 25.</p>
+  <div class="panel" id="orgProgress">Загружаю…</div>
+
+  <div class="toolbar">
+    <button class="act" onclick="loadOrganize()">Проверить снова</button>
+    <a class="act sec" href="/api/organize/plan" download>Скачать план уборки (.sh)</a>
+    <a class="act sec" href="/api/organize/csv" download>Все находки таблицей (.csv)</a>
+    <button class="act sec" onclick="job('reindex')">Переиндексировать изменённое</button>
+    <button class="act sec" onclick="job('structure')">Сверить структуру папок</button>
+  </div>
+  <p class="muted">План уборки — черновик команд переименования, каждая
+    закомментирована: раскомментируйте те, с которыми согласны, и выполните
+    на машине с базой. После уборки нажмите «Переиндексировать изменённое».</p>
+
+  <h2>С чего начать: о ком спрашивают</h2>
+  <div id="orgAsked" class="panel">—</div>
+
+  <h2>Бренды-двойники</h2>
+  <p class="muted">Одно имя в двух написаниях — для поиска это два разных
+    бренда, и вопрос находит только половину документов. Слейте папки в одну.</p>
+  <div id="orgTwins">—</div>
+
+  <h2>Файлы без типа</h2>
+  <p class="muted">Тип не определился из пути — файл лежит вне папок типов.
+    Подсказка выведена из имени файла.</p>
+  <div id="orgUntyped">—</div>
+
+  <h2>Прайсы и сертификаты без даты</h2>
+  <p class="muted">Без даты в имени не работает вытеснение версий: старый и
+    новый прайс равноправны. Подсказка — из времени изменения файла,
+    сверьте её с содержимым.</p>
+  <div id="orgUndated">—</div>
+
+  <h2>Имена, которые врут со временем</h2>
+  <div id="orgBadNames">—</div>
+
+  <h2>Точные дубли</h2>
+  <div id="orgDups">—</div>
+
+  <h2>Пробелы покрытия</h2>
+  <p class="muted">У бренда нет документов целого типа — готовый список задач
+    на сбор: одно письмо поставщику за строку.</p>
+  <div id="orgGaps">—</div>
+</section>
+
 <section id="search">
   <h2>Из чего складывается ответ</h2>
   <p class="muted">Поиск идёт двумя каналами. Текстовый находит точные слова и
@@ -1420,6 +1473,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.t === 'logs') { loadLogLevels(); loadLogs(); }
   if (b.dataset.t === 'queries') { loadQueries(); loadTraces(); }
   if (b.dataset.t === 'kb') loadKb();
+  if (b.dataset.t === 'organize') loadOrganize();
   if (b.dataset.t === 'search') loadSearch();
   if (b.dataset.t === 'eval') loadEval();
   if (b.dataset.t === 'ocr') loadOcr();
@@ -1693,6 +1747,59 @@ async function loadKbHint(){
 }
 
 /* ------------------------------- качество поиска -------------------------- */
+/* ------------------------------- порядок в базе --------------------------- */
+function orgBar(pct){
+  const col = pct>=90?'#3fb950':pct>=60?'#d29922':'#f85149';
+  return `<div style="background:#2a2f3a;border-radius:5px;height:9px;width:180px;display:inline-block;vertical-align:middle;margin:0 8px">
+    <div style="background:${col};height:9px;border-radius:5px;width:${pct}%"></div></div><b>${pct}%</b>`;
+}
+async function loadOrganize(){
+  const st=await (await fetch('/api/organize')).json();
+  const pr=st.progress||{};
+  $('orgProgress').innerHTML = pr.total
+    ? `Файлов в индексе: <b>${pr.total}</b><br>
+       раздел определился: ${orgBar(pr.section)}<br>
+       бренд определился: ${orgBar(pr.brand)}<br>
+       тип определился: ${orgBar(pr.type)}
+       <span class="muted">(цель — больше 90%)</span><br>
+       прайсы и сертификаты с датой: ${orgBar(pr.dated_total?Math.round(100*pr.dated_ok/pr.dated_total):100)}
+       <span class="muted">(${pr.dated_ok} из ${pr.dated_total})</span>`
+    : '<span class="muted">Индекс пуст — сначала проиндексируйте базу.</span>';
+  $('orgAsked').innerHTML = (st.top_asked||[]).length
+    ? st.top_asked.map(b=>`<span style="margin-right:14px"><b>${esc(b.brand)}</b>
+        <span class="muted">${b.asked} вопр.</span></span>`).join('')
+    : '<span class="muted">Журнал вопросов пока пуст — приоритет появится с первыми вопросами сотрудников.</span>';
+  $('orgTwins').innerHTML = (st.brand_twins||[]).length
+    ? '<table><tr><th>написания</th><th>файлов</th></tr>'
+      + st.brand_twins.map(t=>`<tr><td>${t.variants.map(v=>esc(v.brand)).join(' ↔ ')}</td>
+          <td class="muted">${t.variants.map(v=>v.files).join(' / ')}</td></tr>`).join('')+'</table>'
+    : '<div class="panel good">Двойников не найдено.</div>';
+  $('orgUntyped').innerHTML = (st.untyped||[]).length
+    ? '<table><tr><th>файл</th><th>подсказка</th></tr>'
+      + st.untyped.map(u=>`<tr><td><code>${esc(u.path)}</code></td>
+          <td>${u.hint?('→ '+esc(u.hint)):'<span class="muted">?</span>'}</td></tr>`).join('')+'</table>'
+    : '<div class="panel good">У всех файлов определился тип.</div>';
+  $('orgUndated').innerHTML = (st.undated||[]).length
+    ? '<table><tr><th>файл</th><th>тип</th><th>дата файла</th></tr>'
+      + st.undated.map(u=>`<tr><td><code>${esc(u.path)}</code></td><td>${esc(u.doc_type)}</td>
+          <td class="muted">${esc(u.mtime_hint||'')}</td></tr>`).join('')+'</table>'
+    : '<div class="panel good">Все сменяемые документы датированы.</div>';
+  $('orgBadNames').innerHTML = (st.bad_names||[]).length
+    ? '<table><tr><th>файл</th><th>слово</th></tr>'
+      + st.bad_names.map(b=>`<tr><td><code>${esc(b.path)}</code></td>
+          <td>«${esc(b.word)}»</td></tr>`).join('')+'</table>'
+    : '<div class="panel good">Имён со словами «новый/финал/копия» нет.</div>';
+  $('orgDups').innerHTML = (st.duplicates||[]).length
+    ? st.duplicates.map(d=>`<div class="panel" style="margin-bottom:6px">
+        <b>${d.count} копии:</b><br>${d.paths.map(p=>`<code>${esc(p)}</code>`).join('<br>')}</div>`).join('')
+    : '<div class="panel good">Точных дублей нет.</div>';
+  $('orgGaps').innerHTML = (st.gaps||[]).length
+    ? '<table><tr><th>бренд</th><th>чего не хватает</th></tr>'
+      + st.gaps.map(g=>`<tr><td>${esc(g.brand)}</td>
+          <td class="muted">${g.missing.map(esc).join(', ')}</td></tr>`).join('')+'</table>'
+    : '<div class="panel good">У каждого бренда есть документы всех основных типов.</div>';
+}
+
 /* ------------------------------- контрольные вопросы --------------------- */
 let EV_ITEMS = [];
 async function loadEval(){
@@ -3250,6 +3357,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/eval":
             import evalpanel
             return self._json(evalpanel.state())
+        if path == "/api/organize":
+            import organize
+            return self._json(organize.state())
+        if path == "/api/organize/plan":
+            import organize
+            body = organize.cleanup_plan().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-shellscript; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="plan_uborki.sh"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return None
+        if path == "/api/organize/csv":
+            import organize
+            body = organize.problems_csv().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="problemy_bazy.csv"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return None
 
         if path == "/api/schedule":
             import schedule as schedule_mod
