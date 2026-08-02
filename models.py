@@ -416,6 +416,26 @@ def catalog(kind: str | None = None, vram_gb: float | None = None) -> list[dict]
     return out
 
 
+def installed_llms() -> list[dict]:
+    """
+    Языковые модели, готовые к запуску прямо сейчас: веса уже загружены
+    (через каталог или ollama). Для блока «Кто отвечает на вопросы» —
+    чтобы выбрать модель и начать использовать её в два щелчка, не
+    разыскивая её карточку в каталоге.
+    """
+    served = status()
+    current = served.get("model") if served.get("running") else None
+    out = []
+    for m in CATALOG:
+        if m.kind != "llm" or not is_installed(m):
+            continue
+        out.append({"id": m.id, "title": m.title, "params": m.params,
+                    "vram_gb": m.vram_gb,
+                    "engine": resolve_engine(m),
+                    "serving": m.id == current})
+    return out
+
+
 def models_dir() -> Path:
     path = Path(config.MODELS_DIR)
     path.mkdir(parents=True, exist_ok=True)

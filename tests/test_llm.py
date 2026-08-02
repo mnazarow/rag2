@@ -256,3 +256,30 @@ class TestMacModelSupport(Isolated):
             os.environ["PATH"] = saved
             import config
             importlib.reload(config)
+
+
+class TestInstalledPicker(Isolated):
+    """Блок «Кто отвечает» предлагает запускать уже загруженные модели."""
+
+    def test_installed_llms_lists_downloaded(self):
+        import models
+        p = models.local_path(models.BY_ID["qwen3-14b"])
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "model.safetensors").write_bytes(b"x")
+        inst = models.installed_llms()
+        ids = [m["id"] for m in inst]
+        self.assertIn("qwen3-14b", ids)
+        entry = next(m for m in inst if m["id"] == "qwen3-14b")
+        self.assertFalse(entry["serving"])
+        self.assertIn(entry["engine"], ("vllm", "ollama"))
+
+    def test_not_downloaded_not_listed(self):
+        import models
+        ids = [m["id"] for m in models.installed_llms()]
+        self.assertNotIn("qwen3-32b", ids)
+
+    def test_wiring(self):
+        from tests.base import ROOT
+        src = (ROOT / "webui.py").read_text(encoding="utf-8")
+        for needle in ('id="llmServe"', "serveAndUse", '"installed"'):
+            self.assertIn(needle, src, needle)

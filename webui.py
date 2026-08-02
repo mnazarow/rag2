@@ -766,6 +766,13 @@ svg{display:block;width:100%}
     <button class="act" onclick="switchLlm()">Применить</button>
     <button class="act sec" onclick="probeLlm()">Проверить живым запросом</button>
   </div>
+  <div class="toolbar">
+    <label class="muted">загруженная модель
+      <select id="llmServe" style="min-width:260px"></select></label>
+    <button class="act" onclick="serveAndUse()">Запустить и использовать</button>
+    <span class="muted">поднимет сервер модели и сделает её основной
+      (провайдер local); загрузка весов в память — несколько минут</span>
+  </div>
   <div id="llmProbe"></div>
 
   <h2>Очередь запросов к модели</h2>
@@ -2580,6 +2587,22 @@ async function loadLlm(){
       Переключения на запасного: ${x.switches.map(sw=>
         `${esc(sw.at)} ${esc(sw.from)}→${esc(sw.to)} (${esc(sw.why)})`).join('; ')}</div>`:'');
   renderQueue(d.queue||{}, d.queue_stats||{});
+  const sel=$('llmServe');
+  const inst=d.installed||[];
+  sel.innerHTML = inst.length
+    ? inst.map(m=>`<option value="${esc(m.id)}" ${m.serving?'selected':''}>
+        ${esc(m.title)} · ${esc(m.params)} · ${m.vram_gb} ГБ · ${esc(m.engine)}${m.serving?' — работает':''}</option>`).join('')
+    : '<option value="">нет загруженных — скачайте в каталоге ниже</option>';
+  sel.disabled = !inst.length;
+}
+async function serveAndUse(){
+  const id=$('llmServe').value;
+  if(!id){ alert('Сначала скачайте модель в каталоге ниже.'); return; }
+  if(!confirm('Запустить «'+id+'» и сделать её основной? Текущий сервер модели будет перезапущен.')) return;
+  const r=await (await fetch('/api/models/serve',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
+  alert(r.message||'');
+  loadLlm();
 }
 const SRC_RU={'вопрос':'вопрос из чата','голос':'голос и телефон',
   'проверка':'проверка связи','приставки':'смысловые приставки',
@@ -3450,6 +3473,7 @@ class Handler(BaseHTTPRequestHandler):
                 "local_url": config.LOCAL_LLM_BASE_URL,
                 "queue": llm_queue.status(),
                 "queue_stats": llm_queue.stats(24),
+                "installed": models_mod.installed_llms(),
             })
 
         if path == "/api/llm/queue":
