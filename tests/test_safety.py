@@ -316,3 +316,45 @@ class TestSchemaVersion(Isolated):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestErrorSurfacing(Isolated):
+    """Ошибка кнопки должна быть планом действий, а журнал — находить номер."""
+
+    def test_runtime_error_passes_verbatim(self):
+        """Наши проверки бросают RuntimeError с готовым планом — прятать
+        его за номером журнала значит отнимать у человека инструкцию."""
+        import importlib
+
+        import webui
+        importlib.reload(webui)
+        msg = webui.safe_error(RuntimeError("веса не загружены — нажмите «Скачать»"))
+        self.assertIn("Скачать", msg)
+        self.assertNotIn("по номеру", msg)
+
+    def test_unexpected_error_still_masked(self):
+        import importlib
+
+        import webui
+        importlib.reload(webui)
+        msg = webui.safe_error(KeyError("/etc/secret/path"))
+        self.assertIn("по номеру", msg)
+        self.assertNotIn("secret", msg)
+
+    def test_log_search_reaches_beyond_tail(self):
+        import importlib
+
+        import logging_setup
+        importlib.reload(logging_setup)
+        logging_setup.setup()
+        log_file = self.config.LOG_DIR / "web.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write("12:00:00 ERROR    web      [abcd1234] нужная запись\n")
+            for i in range(2000):
+                fh.write(f"12:00:01 INFO     web      наполнитель {i}\n")
+        found = logging_setup.tail(50, search="abcd1234")
+        self.assertTrue(any("abcd1234" in ln for ln in found), found[:3])
+        tail_only = logging_setup.tail(50)
+        self.assertFalse(any("abcd1234" in ln for ln in tail_only),
+                         "запись в хвосте — тест не проверяет глубину")

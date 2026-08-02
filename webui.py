@@ -160,7 +160,14 @@ def read_env() -> dict:
 
 # Ошибки, которые можно показать целиком: они говорят о действии
 # пользователя, а не об устройстве сервера.
-_SAFE_ERRORS = ("Busy", "ValueError", "LLMBusy", "Blocked", "OcrError")
+# RuntimeError здесь не случайно: наши собственные проверки («веса ещё
+# не загружены — нажмите Скачать», «vllm на macOS не работает») бросают
+# именно его, и прятать такой текст за номером журнала — значит отнимать
+# у человека готовый план действий. Чужие RuntimeError из библиотек
+# наружу не попадают: провайдеры и подпроцессы заворачивают их в свои
+# типы, а неожиданное падение — это почти всегда не RuntimeError.
+_SAFE_ERRORS = ("Busy", "ValueError", "LLMBusy", "Blocked", "OcrError",
+                "RuntimeError", "JobError")
 
 
 def safe_error(exc: BaseException, context: str = "") -> str:
@@ -1216,6 +1223,8 @@ svg{display:block;width:100%}
     <select id="lgLevel"><option value="">все уровни</option><option>TRACE</option>
       <option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option></select>
     <input id="lgSub" placeholder="подсистема" style="width:160px">
+    <input id="lgQ" placeholder="поиск: номер ошибки или текст" style="width:230px"
+           onkeydown="if(event.key==='Enter')loadLogs()">
     <input id="lgLines" type="text" value="300" style="width:80px">
     <button class="act sec" onclick="loadLogs()">Обновить</button>
     <label class="muted"><input type="checkbox" id="lgAuto"> автообновление</label>
@@ -3009,10 +3018,12 @@ async function setLevel(sub,level){
     body:JSON.stringify({subsystem:sub,level})});
 }
 async function loadLogs(){
-  const q=new URLSearchParams({lines:$('lgLines').value||'300',
-    level:$('lgLevel').value,subsystem:$('lgSub').value});
-  const d=await (await fetch('/api/log?'+q)).json();
-  $('logOut').textContent=d.lines.join('\n')||'Пусто.';
+  const params={lines:$('lgLines').value||'300',
+    level:$('lgLevel').value,subsystem:$('lgSub').value};
+  if($('lgQ').value.trim()) params.q=$('lgQ').value.trim();
+  const d=await (await fetch('/api/log?'+new URLSearchParams(params))).json();
+  $('logOut').textContent=d.lines.join('\n')
+    ||(params.q?'Ничего не найдено по «'+params.q+'» — поиск шёл по всей глубине журналов.':'Пусто.');
   $('logOut').scrollTop=$('logOut').scrollHeight;
 }
 setInterval(()=>{if($('lgAuto').checked&&$('logs').classList.contains('on'))loadLogs();},4000);
@@ -3726,7 +3737,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"lines": logging_setup.tail(
                 int(query.get("lines", ["300"])[0]),
                 query.get("level", [""])[0] or None,
-                query.get("subsystem", [""])[0] or None)})
+                query.get("subsystem", [""])[0] or None,
+                search=query.get("q", [""])[0] or None)})
         if path == "/api/log/levels":
             return self._json(logging_setup.levels())
 

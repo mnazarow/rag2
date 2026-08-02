@@ -378,7 +378,7 @@ def log_files() -> list[Path]:
 
 
 def tail(lines: int = 200, level: str | None = None, subsystem: str | None = None,
-         process: str | None = None) -> list[str]:
+         process: str | None = None, search: str | None = None) -> list[str]:
     """
     Последние строки журнала — для показа в админке.
 
@@ -388,6 +388,11 @@ def tail(lines: int = 200, level: str | None = None, subsystem: str | None = Non
     первый при разборе.
     """
     rows: list[str] = []
+    # Поиск (например, по номеру ошибки из сообщения «подробности в
+    # журнале») обязан смотреть глубже хвоста: событие могло случиться
+    # давно, и «поиск, который ищет только в последних строках» хуже
+    # отсутствия поиска — он молча говорит «не найдено» про то, что есть.
+    depth = 4_000_000 if search else lines * 400
     for path in log_files():
         who = path.stem
         if process and process != who:
@@ -396,12 +401,15 @@ def tail(lines: int = 200, level: str | None = None, subsystem: str | None = Non
             with path.open("rb") as fh:
                 fh.seek(0, 2)
                 size = fh.tell()
-                block = min(size, lines * 400)
+                block = min(size, depth)
                 fh.seek(size - block)
                 chunk = fh.read().decode("utf-8", "ignore")
         except OSError:
             continue
-        for line in chunk.splitlines()[-lines * 2:]:
+        source = chunk.splitlines()
+        if search:
+            source = [ln for ln in source if search.lower() in ln.lower()]
+        for line in source[-lines * 2:]:
             rows.append(f"{line[:8]} {who:<7}{line[8:]}" if len(line) > 8 else line)
     # Сортируем по времени в начале строки: формат одинаковый у всех.
     data = "\n".join(sorted(rows, key=lambda x: x[:8]))
