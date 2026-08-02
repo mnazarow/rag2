@@ -551,6 +551,18 @@ def _pid_file() -> Path:
     return Path(config.DATA_DIR) / "model_server.json"
 
 
+def _ollama_has(tag: str) -> bool:
+    """Загружены ли веса этой модели в ollama."""
+    try:
+        out = subprocess.run(["ollama", "list"], capture_output=True,
+                             text=True, timeout=10).stdout
+        base = tag.split(":")[0]
+        return any(line.split()[0].startswith(base) for line in
+                   out.strip().splitlines()[1:] if line.split())
+    except Exception:  # noqa: BLE001 — не смогли проверить: не мешаем запуску
+        return True
+
+
 def _ollama_alive() -> bool:
     """Отвечает ли сервер ollama на стандартном порту."""
     try:
@@ -618,10 +630,29 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
                 if _ollama_alive():
                     break
                 time.sleep(0.5)
+            if not _ollama_alive():
+                raise RuntimeError(
+                    "сервер ollama не поднялся за 10 секунд. Запустите его "
+                    "вручную (команда `ollama serve` или приложение Ollama) "
+                    "и посмотрите, что он пишет.")
+        # Кнопку «Запустить» жмут и до загрузки весов — это самый частый
+        # случай. Честный отказ с планом действий лучше «запустилось», за
+        # которым каждый вопрос отвечал бы ошибкой 404 от ollama.
+        if not _ollama_has(spec.ollama_tag):
+            raise RuntimeError(
+                f"веса «{spec.ollama_tag}» ещё не загружены в ollama. "
+                f"Нажмите «Скачать» в карточке модели (или выполните "
+                f"`ollama pull {spec.ollama_tag}`) и запустите снова.")
         served = spec.ollama_tag
     elif engine == "vllm":
+        if _apple_silicon():
+            raise RuntimeError(
+                "vllm на macOS не работает, а варианта для ollama у этой "
+                "модели нет. Выберите из каталога модель с тегом ollama — "
+                "например, Qwen3.6 27B, Qwen3 14B или Gemma 3.")
         if not _has_python_module("vllm"):
-            raise RuntimeError("не установлен vllm: pip install vllm")
+            raise RuntimeError("не установлен vllm: pip install vllm — "
+                               "установщик ставит его сам на машинах с картой NVIDIA")
         path = local_path(spec)
         if download_in_progress(spec):
             raise RuntimeError(
@@ -684,7 +715,8 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
             pass
         log.info("настройки обновлены: ассистент будет обращаться к %s", base_url)
 
-    log.info("модель «%s» запускается, процесс %d", spec.title, proc.pid)
+    log.info("модель «%s» запускается%s", spec.title,
+             f", процесс {proc.pid}" if proc else " (внешний сервер ollama)")
     return state
 
 

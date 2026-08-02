@@ -283,3 +283,54 @@ class TestInstalledPicker(Isolated):
         src = (ROOT / "webui.py").read_text(encoding="utf-8")
         for needle in ('id="llmServe"', "serveAndUse", '"installed"'):
             self.assertIn(needle, src, needle)
+
+
+class TestServeErrors(Isolated):
+    """Кнопка «Запустить»: счастливый путь работает, отказы объясняют себя."""
+
+    def _mac_stack(self, st, has_ollama=True, alive=True, pulled=True):
+        import platform
+        from unittest import mock
+
+        import models
+        st.enter_context(mock.patch.object(platform, "system",
+                                           return_value="Darwin"))
+        st.enter_context(mock.patch.object(platform, "machine",
+                                           return_value="arm64"))
+        st.enter_context(mock.patch.object(
+            models.shutil, "which",
+            lambda x: "/x/ollama" if (x == "ollama" and has_ollama) else None))
+        st.enter_context(mock.patch.object(models, "_ollama_alive",
+                                           return_value=alive))
+        st.enter_context(mock.patch.object(models, "_ollama_has",
+                                           return_value=pulled))
+
+    def test_external_ollama_serve_does_not_crash(self):
+        """Регрессия: запущенное приложение Ollama роняло serve на proc.pid."""
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st)
+            state = models.serve("qwen3.6-27b", apply_config=False)
+        self.assertTrue(state["external"])
+        self.assertEqual(state["engine"], "ollama")
+        self.assertIsNone(state["pid"])
+
+    def test_not_pulled_explains_next_step(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st, pulled=False)
+            with self.assertRaisesRegex(RuntimeError, "ollama pull"):
+                models.serve("qwen3.6-27b", apply_config=False)
+
+    def test_vllm_model_on_mac_redirects_to_ollama_models(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st)
+            with self.assertRaisesRegex(RuntimeError, "ollama"):
+                models.serve("t-pro-2.0", apply_config=False)
