@@ -334,3 +334,25 @@ class TestServeErrors(Isolated):
             self._mac_stack(st)
             with self.assertRaisesRegex(RuntimeError, "ollama"):
                 models.serve("t-pro-2.0", apply_config=False)
+
+    def test_second_serve_with_external_server_does_not_crash(self):
+        """Регрессия: os.kill(None) в stop() ронял ПОВТОРНЫЙ запуск при
+        внешнем сервере ollama ошибкой «NoneType … integer»."""
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st)
+            models.serve("qwen3.6-27b", apply_config=False)
+            state = models.serve("qwen3.6-35b-a3b", apply_config=False)
+        self.assertEqual(state["model"], "qwen3.6-35b-a3b")
+
+    def test_stop_external_unbinds_without_killing(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st)
+            models.serve("qwen3.6-27b", apply_config=False)
+            self.assertTrue(models.stop())
+        self.assertFalse(models._pid_file().exists())

@@ -785,7 +785,16 @@ def check(model_id: str) -> dict:
 def stop() -> bool:
     state = status()
     if not state.get("running"):
+        _pid_file().unlink(missing_ok=True)
         return False
+    # Внешний сервер (приложение Ollama на маке) мы не запускали — не нам
+    # его и убивать: у записи о нём нет номера процесса, и os.kill(None)
+    # ронял ЗАПУСК следующей модели ошибкой «NoneType … integer».
+    # Забываем привязку и оставляем сервер соседям.
+    if state.get("external") or not state.get("pid"):
+        _pid_file().unlink(missing_ok=True)
+        log.info("внешний сервер модели отвязан (процесс не наш — не трогаем)")
+        return True
     try:
         os.kill(state["pid"], 15)
         log.info("остановлен процесс модели %d", state["pid"])
