@@ -347,15 +347,42 @@ class TestServeErrors(Isolated):
             state = models.serve("qwen3.6-35b-a3b", apply_config=False)
         self.assertEqual(state["model"], "qwen3.6-35b-a3b")
 
-    def test_stop_external_unbinds_without_killing(self):
+    def test_stop_external_unloads_model_and_explains(self):
+        """«Остановить» при внешнем Ollama: модель выгружается из памяти
+        (keep_alive=0), приложение не трогаем, журнал говорит понятно."""
         import contextlib
+        from unittest import mock
 
         import models
         with contextlib.ExitStack() as st:
             self._mac_stack(st)
+            unload = st.enter_context(mock.patch.object(
+                models, "_ollama_unload", return_value=True))
             models.serve("qwen3.6-27b", apply_config=False)
             self.assertTrue(models.stop())
         self.assertFalse(models._pid_file().exists())
+        tag = models.BY_ID["qwen3.6-27b"].ollama_tag
+        unload.assert_called_once_with(tag)
+        last = models.action_log(1)[0]
+        self.assertEqual(last["action"], "остановка")
+        self.assertIn("выгружена из памяти", last["detail"])
+
+    def test_stop_external_unload_failed_still_unbinds(self):
+        """Если Ollama не ответила на выгрузку — всё равно отвязываемся,
+        а журнал объясняет, что память освободится по таймауту."""
+        import contextlib
+        from unittest import mock
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st)
+            st.enter_context(mock.patch.object(
+                models, "_ollama_unload", return_value=False))
+            models.serve("qwen3.6-27b", apply_config=False)
+            self.assertTrue(models.stop())
+        self.assertFalse(models._pid_file().exists())
+        last = models.action_log(1)[0]
+        self.assertIn("освободится сама", last["detail"])
 
 
 class TestModelProgressAndLog(Isolated):

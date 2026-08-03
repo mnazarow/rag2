@@ -895,6 +895,21 @@ def check(model_id: str) -> dict:
             "installed": is_installed(spec), "engine": engine}
 
 
+def _ollama_unload(tag: str) -> bool:
+    """Просит Ollama выгрузить модель из памяти, не трогая само приложение.
+
+    Пустой запрос с keep_alive=0 — штатный способ Ollama освободить память
+    сразу, а не по таймауту. Сервер продолжает работать.
+    """
+    try:
+        import httpx
+        return httpx.post("http://127.0.0.1:11434/api/generate",
+                          json={"model": tag, "keep_alive": 0},
+                          timeout=10).status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def stop() -> bool:
     state = status()
     if not state.get("running"):
@@ -903,12 +918,20 @@ def stop() -> bool:
     # Внешний сервер (приложение Ollama на маке) мы не запускали — не нам
     # его и убивать: у записи о нём нет номера процесса, и os.kill(None)
     # ронял ЗАПУСК следующей модели ошибкой «NoneType … integer».
-    # Забываем привязку и оставляем сервер соседям.
+    # Но модель из памяти выгружаем — иначе она продолжает занимать её
+    # даже после «остановки». Само приложение Ollama оставляем работать.
     if state.get("external") or not state.get("pid"):
+        tag = state.get("served_name") or ""
+        unloaded = (state.get("engine") == "ollama" and tag
+                    and _ollama_unload(tag))
         _pid_file().unlink(missing_ok=True)
-        record_action("остановка", state.get("model", "?"),
-                      "внешний сервер отвязан, процесс не наш")
-        log.info("внешний сервер модели отвязан (процесс не наш — не трогаем)")
+        detail = ("модель выгружена из памяти, приложение Ollama оставлено "
+                  "работать" if unloaded else
+                  "отвязались от сервера Ollama (запускали его не мы); "
+                  "выгрузить модель из памяти не удалось — она освободится "
+                  "сама через несколько минут простоя")
+        record_action("остановка", state.get("model", "?"), detail)
+        log.info("остановка внешнего сервера: %s", detail)
         return True
     try:
         os.kill(state["pid"], 15)
