@@ -5,6 +5,8 @@
 #   ./update.sh --target DIR        — обновить установку в другой папке
 #   ./update.sh --from DIR          — взять код отсюда (например из клона git)
 #   ./update.sh --backup-only       — только сделать резервную копию
+#   ./update.sh --no-backup         — обновить БЕЗ копии (быстрее; --rollback
+#                                     откатит к предыдущей, более старой копии)
 #   ./update.sh --rollback          — вернуться к предыдущей версии
 #
 # Про --target и --from. Частый случай: репозиторий склонирован в одну
@@ -19,13 +21,15 @@ set -Eeuo pipefail
 TARGET=""
 SOURCE=""
 MODE=update
+WITH_BACKUP=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --target) TARGET="${2:-}"; shift 2 ;;
     --from)   SOURCE="${2:-}"; shift 2 ;;
     --backup-only) MODE=backup; shift ;;
+    --no-backup)   WITH_BACKUP=0; shift ;;
     --rollback)    MODE=rollback; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) printf "Неизвестный ключ: %s\n" "$1" >&2; exit 2 ;;
   esac
 done
@@ -130,7 +134,21 @@ if [ "${KB_UPDATE_STAGE2:-0}" = 1 ]; then
   ok "Продолжаю обновлённым скриптом"
 else
 
-backup >/dev/null
+if [ "$WITH_BACKUP" = 1 ]; then
+  backup >/dev/null
+else
+  # Пропуск копии — осознанный обмен: минус несколько минут сейчас,
+  # минус свежая точка отката потом. --rollback никуда не денется, но
+  # откатит к ПРЕДЫДУЩЕЙ копии — с ней уедут и настройки, менявшиеся
+  # после неё. Говорим об этом до обновления, а не после аварии.
+  warn "Резервная копия пропущена (--no-backup)."
+  LAST_BK="$(ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | head -1 || true)"
+  if [ -n "$LAST_BK" ]; then
+    echo "     Откат будет к копии: $LAST_BK"
+  else
+    echo "     Копий нет вовсе — откатываться будет некуда."
+  fi
+fi
 
 say "Останавливаю службы"
 if command -v systemctl >/dev/null 2>&1 \
@@ -189,11 +207,10 @@ NEW_SUM="$(cksum < "$TARGET/install/update.sh" 2>/dev/null || echo none)"
 if [ -f "$TARGET/install/update.sh" ] && [ "$NEW_SUM" != "$SELF_SUM" ]; then
   say "Скрипт обновления обновился — продолжаю новой версией"
   export KB_UPDATE_STAGE2=1
-  if [ -n "$SOURCE" ]; then
-    exec bash "$TARGET/install/update.sh" --target "$TARGET" --from "$SOURCE"
-  else
-    exec bash "$TARGET/install/update.sh" --target "$TARGET"
-  fi
+  STAGE2_ARGS=(--target "$TARGET")
+  [ -n "$SOURCE" ] && STAGE2_ARGS+=(--from "$SOURCE")
+  [ "$WITH_BACKUP" = 0 ] && STAGE2_ARGS+=(--no-backup)
+  exec bash "$TARGET/install/update.sh" "${STAGE2_ARGS[@]}"
 fi
 
 fi   # конец пропуска подготовительных шагов (KB_UPDATE_STAGE2)
@@ -300,5 +317,9 @@ if command -v systemctl >/dev/null 2>&1 \
 fi
 
 printf "\n${GREEN}Обновление завершено.${NC}\n"
-echo "Копия предыдущей версии: $BACKUP_DIR/$STAMP"
+if [ "$WITH_BACKUP" = 1 ]; then
+  echo "Копия предыдущей версии: $BACKUP_DIR/$STAMP"
+else
+  echo "Копия при этом обновлении не делалась (--no-backup)."
+fi
 echo "Если что-то пошло не так: $0 --rollback"

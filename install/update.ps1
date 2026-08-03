@@ -2,6 +2,7 @@
 .SYNOPSIS  Обновление ассистента. Индекс и настройки сохраняются.
 .PARAMETER Rollback   Вернуться к предыдущей версии.
 .PARAMETER BackupOnly Только сделать резервную копию.
+.PARAMETER NoBackup Обновить без копии (быстрее; откат — к предыдущей копии).
 #>
 param([switch]$Rollback, [switch]$BackupOnly, [string]$Target, [string]$From)
 $ErrorActionPreference = "Stop"
@@ -56,12 +57,18 @@ if ($Rollback) {
 
 Say "Делаю резервную копию"
 $dest = Join-Path $Backups $stamp
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-foreach ($i in @(".env","data","logs")) {
-  if (Test-Path "$Dir\$i") { Copy-Item -Recurse -Force "$Dir\$i" $dest; Ok $i }
+if (-not $NoBackup -or $BackupOnly) {
+  New-Item -ItemType Directory -Force -Path $dest | Out-Null
+  foreach ($i in @(".env","data","logs")) {
+    if (Test-Path "$Dir\$i") { Copy-Item -Recurse -Force "$Dir\$i" $dest; Ok $i }
+  }
+  Get-ChildItem $Backups -Directory | Sort-Object LastWriteTime -Desc |
+    Select-Object -Skip 5 | Remove-Item -Recurse -Force
+} else {
+  # Пропуск копии — осознанный обмен: быстрее сейчас, но -Rollback
+  # откатит к предыдущей, более старой копии.
+  Warn "Резервная копия пропущена (-NoBackup); откат будет к предыдущей копии."
 }
-Get-ChildItem $Backups -Directory | Sort-Object LastWriteTime -Desc |
-  Select-Object -Skip 5 | Remove-Item -Recurse -Force
 if ($BackupOnly) { Ok "Копия: $dest"; exit 0 }
 
 Say "Останавливаю процессы"

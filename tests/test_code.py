@@ -405,6 +405,19 @@ class TestQuickStart(unittest.TestCase):
         self.assertIn("-NoService", doc)
         self.assertIn("admin / admin", doc)
 
+    def test_update_backup_can_be_skipped(self):
+        """
+        Ключ отказа от копии при обновлении — в обоих скриптах, с
+        передачей во вторую стадию: потерянный при самообновлении ключ
+        означал бы копию вопреки явному «не делать».
+        """
+        sh = (ROOT / "install" / "update.sh").read_text(encoding="utf-8")
+        ps = (ROOT / "install" / "update.ps1").read_text(encoding="utf-8")
+        self.assertIn("--no-backup", sh)
+        self.assertIn("WITH_BACKUP=0", sh)
+        self.assertIn('STAGE2_ARGS+=(--no-backup)', sh)
+        self.assertIn("NoBackup", ps)
+
     def test_ollama_installed_by_all_installers(self):
         """
         ollama ставят и установка, и обновление, на всех трёх системах:
