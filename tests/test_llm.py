@@ -356,3 +356,63 @@ class TestServeErrors(Isolated):
             models.serve("qwen3.6-27b", apply_config=False)
             self.assertTrue(models.stop())
         self.assertFalse(models._pid_file().exists())
+
+
+class TestModelProgressAndLog(Isolated):
+    """Прогресс-бар и журнал действий в разделе «Модели»."""
+
+    def test_action_log_roundtrip_and_cap(self):
+        import models
+        for i in range(5):
+            models.record_action("запуск", f"m{i}", "деталь")
+        log = models.action_log(3)
+        self.assertEqual(len(log), 3)
+        self.assertEqual(log[0]["model"], "m4")
+
+    def test_percent_parsed_from_both_downloaders(self):
+        import models
+        for line in ("pulling 9f3a: 45% ▕████▏ 4.2 GB/9.1 GB",
+                     "model.safetensors:  78%|███▊| 7.1G/9.1G"):
+            self.assertTrue(models._PERCENT_RX.findall(line), line)
+
+    def test_install_writes_progress_and_log(self):
+        from unittest import mock
+
+        import models
+        with mock.patch.object(models, "hardware",
+                               return_value={"vram_total_gb": 24}), \
+             mock.patch.object(models.shutil, "which",
+                               lambda x: "/x/ollama" if x == "ollama" else None), \
+             mock.patch.object(models.subprocess, "Popen") as pop:
+            pop.return_value.stdout = iter(["pulling: 10%", "pulling: 95%"])
+            pop.return_value.wait = lambda: None
+            pop.return_value.returncode = 0
+            models.install("qwen3.6-27b", engine="ollama")
+        state = models.download_progress()
+        self.assertTrue(state["done"])
+        self.assertEqual(state["percent"], 100)
+        self.assertEqual(models.action_log(1)[0]["action"], "загрузка завершена")
+
+    def test_failed_install_recorded(self):
+        from unittest import mock
+
+        import models
+        with mock.patch.object(models, "hardware",
+                               return_value={"vram_total_gb": 24}), \
+             mock.patch.object(models.shutil, "which",
+                               lambda x: "/x/ollama" if x == "ollama" else None), \
+             mock.patch.object(models.subprocess, "Popen") as pop:
+            pop.return_value.stdout = iter(["boom"])
+            pop.return_value.wait = lambda: None
+            pop.return_value.returncode = 1
+            with self.assertRaises(RuntimeError):
+                models.install("qwen3.6-27b", engine="ollama")
+        self.assertTrue(models.download_progress()["error"])
+        self.assertEqual(models.action_log(1)[0]["action"], "загрузка не удалась")
+
+    def test_wiring(self):
+        from tests.base import ROOT
+        src = (ROOT / "webui.py").read_text(encoding="utf-8")
+        for needle in ('"/api/models/progress"', 'id="mProgress"',
+                       'id="mActions"', "loadModelProgress"):
+            self.assertIn(needle, src, needle)

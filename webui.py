@@ -809,6 +809,12 @@ svg{display:block;width:100%}
   <div class="cards" id="hwCards"></div>
   <h2>Сервер модели</h2>
   <div class="toolbar" id="serverBar"></div>
+  <div id="mProgress"></div>
+
+  <h2>Журнал действий с моделями</h2>
+  <p class="muted">Загрузки, запуски, остановки и их ошибки — только про
+    модели, без шума остального журнала. Обновляется сам, пока открыт раздел.</p>
+  <div id="mActions" class="panel">—</div>
   <h2>Каталог моделей</h2>
   <div class="toolbar filterbar">
     <input id="mFilter" placeholder="фильтр по названию">
@@ -1483,7 +1489,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $(b.dataset.t).classList.add('on');
   if (b.dataset.t === 'quick') loadQuick();
-  if (b.dataset.t === 'models') { loadModels(); loadLlm(); }
+  if (b.dataset.t === 'models') { loadModels(); loadLlm(); loadModelProgress(); }
   if (b.dataset.t === 'diag') loadDiag();
   if (b.dataset.t === 'voice') loadVoices();
   if (b.dataset.t === 'logs') { loadLogLevels(); loadLogs(); }
@@ -2567,6 +2573,50 @@ async function forgetUser(){
 }
 
 /* ------------------------------- модель ответа ---------------------------- */
+/* ---------------------- прогресс и журнал действий с моделями ------------ */
+function mBar(pct, note, color){
+  const width = pct==null ? 100 : Math.min(pct,100);
+  const anim = pct==null ? 'opacity:.55;' : '';
+  return `<div style="background:#2a2f3a;border-radius:6px;height:14px;max-width:460px;position:relative;margin:6px 0">
+    <div style="background:${color||'#2f6fb0'};height:14px;border-radius:6px;width:${width}%;${anim}"></div>
+    <span style="position:absolute;top:-1px;left:8px;font-size:11px;color:#e6e8ec">${esc(note||'')}</span></div>`;
+}
+async function loadModelProgress(){
+  let d;
+  try{ d=await (await fetch('/api/models/progress')).json(); }catch(e){ return; }
+  let html='';
+  const dl=d.download;
+  if(dl && !dl.error && !dl.done){
+    html += `<div class="panel" style="margin-top:8px"><b>Загрузка весов: ${esc(dl.model)}</b>
+      ${mBar(dl.percent, dl.percent!=null?dl.percent+'%':'подготовка…')}
+      <span class="muted">${esc(dl.note||'')}${dl.stale?' · давно нет новостей — смотрите «Конвейер»':''}</span></div>`;
+  } else if(dl && dl.error){
+    html += `<div class="panel"><span class="bad"><b>Загрузка ${esc(dl.model)} не удалась:</b>
+      ${esc(dl.error)}</span></div>`;
+  } else if(dl && dl.done){
+    html += `<div class="panel good">Загрузка ${esc(dl.model)} завершена.</div>`;
+  }
+  const sv=d.server||{};
+  if(sv.running){
+    html += `<div class="panel" style="margin-top:8px"><b>Запуск: ${esc(sv.model||'')}</b>
+      (${esc(sv.engine||'')})
+      ${sv.ready
+        ? mBar(100,'отвечает на '+(sv.base_url||''),'#3fb950')
+        : mBar(null,'загружаются веса… '+Math.round((sv.elapsed||0))+' с')}
+      ${sv.ready?'' :'<span class="muted">Большая модель поднимается несколько минут; строка позеленеет, когда сервер начнёт отвечать.</span>'}</div>`;
+  }
+  $('mProgress').innerHTML=html;
+  const ACT_RU={'загрузка начата':'⬇','загрузка завершена':'✓','загрузка не удалась':'✗',
+    'запуск':'▶','запуск не удался':'✗','остановка':'■'};
+  $('mActions').innerHTML=(d.log||[]).length
+    ? '<table><tr><th style="width:130px">когда</th><th style="width:170px">действие</th><th>модель</th><th>подробности</th></tr>'
+      + d.log.map(a=>`<tr><td class="muted">${esc((a.ts||'').replace('T',' ').slice(5,16))}</td>
+        <td>${ACT_RU[a.action]||''} ${esc(a.action)}</td><td><b>${esc(a.model)}</b></td>
+        <td class="muted">${esc(a.detail||'')}</td></tr>`).join('')+'</table>'
+    : '<span class="muted">Действий с моделями ещё не было.</span>';
+}
+setInterval(()=>{if($('models').classList.contains('on'))loadModelProgress();},3000);
+
 async function loadLlm(){
   const d=await (await fetch('/api/llm')).json();
   const x=d.describe||{};
@@ -3492,6 +3542,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"status": llm_queue.status(),
                                "stats": llm_queue.stats(
                                    int(query.get("hours", ["24"])[0] or 24))})
+
+        if path == "/api/models/progress":
+            import models as models_mod
+            state = models_mod.progress_state()
+            state["log"] = models_mod.action_log(40)
+            return self._json(state)
 
         if path == "/api/models/check":
             import models as models_mod

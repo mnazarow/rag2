@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import platform
 import shutil
@@ -481,7 +482,19 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
     if not spec:
         raise ValueError(f"нет такой модели в каталоге: {model_id}")
     engine = resolve_engine(spec, engine)
-    say = progress or (lambda text: log.info("%s", text))
+    base_say = progress or (lambda text: log.info("%s", text))
+
+    def say(text: str) -> None:
+        base_say(text)
+        # Процент — из строк загрузчика: и ollama pull, и huggingface
+        # печатают «NN%». Берём последний в строке и держим в файле,
+        # который читает прогресс-бар админки.
+        m = _PERCENT_RX.findall(text)
+        if m:
+            _write_download_progress(spec.id, min(int(m[-1]), 100), text)
+
+    record_action("загрузка начата", spec.id, f"движок {engine}")
+    _write_download_progress(spec.id, None, "подготовка")
 
     hw = hardware()
     if spec.kind == "llm" and hw["vram_total_gb"] and not spec.fits(hw["vram_total_gb"]):
@@ -500,7 +513,13 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
             say(line.rstrip())
         proc.wait()
         if proc.returncode != 0:
+            _write_download_progress(spec.id, None, "", done=True,
+                                     error=f"ollama вернул код {proc.returncode}")
+            record_action("загрузка не удалась", spec.id,
+                          f"ollama вернул код {proc.returncode}")
             raise RuntimeError(f"ollama вернул код {proc.returncode}")
+        _write_download_progress(spec.id, 100, "готово", done=True)
+        record_action("загрузка завершена", spec.id, f"ollama: {spec.ollama_tag}")
         return {"model": spec.id, "engine": "ollama", "tag": spec.ollama_tag}
 
     target = local_path(spec)
@@ -527,6 +546,10 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
             say(line.rstrip())
         proc.wait()
         if proc.returncode != 0:
+            _write_download_progress(spec.id, None, "", done=True,
+                                     error=f"код {proc.returncode}")
+            record_action("загрузка не удалась", spec.id,
+                          f"huggingface, код {proc.returncode}")
             raise RuntimeError(f"загрузка не удалась, код {proc.returncode}. "
                                "Из России площадка недоступна напрямую — укажите "
                                "зеркало в настройке HF_MIRROR или используйте прокси.")
@@ -542,6 +565,8 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
                           endpoint=config.HF_MIRROR or None)
     # Признак незавершённости снимаем только теперь, когда всё скачано.
     marker.unlink(missing_ok=True)
+    _write_download_progress(spec.id, 100, "готово", done=True)
+    record_action("загрузка завершена", spec.id, str(target))
     say("Готово.")
     return {"model": spec.id, "engine": engine, "path": str(target)}
 
@@ -549,6 +574,82 @@ def install(model_id: str, engine: str | None = None, progress=None) -> dict:
 # ------------------------------------------------------------------ запуск --
 def _pid_file() -> Path:
     return Path(config.DATA_DIR) / "model_server.json"
+
+
+def _progress_file() -> Path:
+    return Path(config.DATA_DIR) / "model_download.json"
+
+
+_PERCENT_RX = re.compile(r"(\d{1,3})\s?%")
+
+
+def _ensure_actions_table() -> None:
+    import db
+    db.telemetry().execute("""CREATE TABLE IF NOT EXISTS model_actions (
+        id INTEGER PRIMARY KEY, ts TEXT, action TEXT, model TEXT, detail TEXT)""")
+    db.telemetry().commit()
+
+
+def record_action(action: str, model: str, detail: str = "") -> None:
+    """
+    Журнал действий с моделями — для панели в разделе «Модели».
+
+    Общий журнал системы эти события тоже пишет, но там они тонут между
+    строками поиска и индексации. Действия с моделями редки, дороги
+    (гигабайты и минуты) и разбираются отдельно — им положена своя лента.
+    Ошибка записи не роняет само действие никогда.
+    """
+    try:
+        import db
+        _ensure_actions_table()
+        from datetime import datetime, timezone
+        db.trun("INSERT INTO model_actions (ts, action, model, detail) "
+                "VALUES (?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 action, model, detail[:400]))
+        db.trun("DELETE FROM model_actions WHERE id NOT IN "
+                "(SELECT id FROM model_actions ORDER BY id DESC LIMIT 500)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def action_log(limit: int = 40) -> list[dict]:
+    try:
+        import db
+        _ensure_actions_table()
+        return [dict(r) for r in db.tq(
+            "SELECT ts, action, model, detail FROM model_actions "
+            "ORDER BY id DESC LIMIT ?", (limit,))]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _write_download_progress(model: str, percent: int | None, note: str,
+                             done: bool = False, error: str = "") -> None:
+    try:
+        _progress_file().write_text(json.dumps({
+            "model": model, "percent": percent, "note": note[:200],
+            "done": done, "error": error[:300], "ts": time.time()},
+            ensure_ascii=False))
+    except OSError:
+        pass
+
+
+def download_progress() -> dict | None:
+    """Текущая (или последняя) загрузка весов — для прогресс-бара."""
+    path = _progress_file()
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    # Завершённая больше десяти минут назад — уже не новость.
+    if state.get("done") and time.time() - state.get("ts", 0) > 600:
+        return None
+    state["stale"] = (not state.get("done")
+                      and time.time() - state.get("ts", 0) > 120)
+    return state
 
 
 def _ollama_has(tag: str) -> bool:
@@ -602,6 +703,15 @@ def status() -> dict:
 def serve(model_id: str, engine: str | None = None, port: int | None = None,
           apply_config: bool = True) -> dict:
     """Поднимает сервер модели и, если попросили, прописывает его в настройки."""
+    try:
+        return _serve(model_id, engine, port, apply_config)
+    except Exception as exc:
+        record_action("запуск не удался", model_id, str(exc))
+        raise
+
+
+def _serve(model_id: str, engine: str | None = None, port: int | None = None,
+           apply_config: bool = True) -> dict:
     spec = BY_ID.get(model_id)
     if not spec:
         raise ValueError(f"нет такой модели: {model_id}")
@@ -715,6 +825,9 @@ def serve(model_id: str, engine: str | None = None, port: int | None = None,
             pass
         log.info("настройки обновлены: ассистент будет обращаться к %s", base_url)
 
+    record_action("запуск", spec.id,
+                  f"{engine}, {base_url}"
+                  + ("" if proc else " (внешний сервер ollama)"))
     log.info("модель «%s» запускается%s", spec.title,
              f", процесс {proc.pid}" if proc else " (внешний сервер ollama)")
     return state
@@ -793,16 +906,37 @@ def stop() -> bool:
     # Забываем привязку и оставляем сервер соседям.
     if state.get("external") or not state.get("pid"):
         _pid_file().unlink(missing_ok=True)
+        record_action("остановка", state.get("model", "?"),
+                      "внешний сервер отвязан, процесс не наш")
         log.info("внешний сервер модели отвязан (процесс не наш — не трогаем)")
         return True
     try:
         os.kill(state["pid"], 15)
+        record_action("остановка", state.get("model", "?"),
+                      f"процесс {state['pid']}")
         log.info("остановлен процесс модели %d", state["pid"])
     except OSError as exc:
         log.warning("не удалось остановить процесс: %s", exc)
         return False
     _pid_file().unlink(missing_ok=True)
     return True
+
+
+def progress_state() -> dict:
+    """Всё для панели прогресса: загрузка, сервер, готовность отвечать."""
+    server = status()
+    ready = False
+    if server.get("running") and server.get("base_url"):
+        try:
+            import httpx
+            ready = httpx.get(server["base_url"].rstrip("/") + "/models",
+                              timeout=1.5).status_code == 200
+        except Exception:  # noqa: BLE001
+            ready = False
+    if server.get("running"):
+        server["ready"] = ready
+        server["elapsed"] = int(time.time() - server.get("started", time.time()))
+    return {"download": download_progress(), "server": server}
 
 
 def wait_ready(base_url: str, timeout: int = 600) -> bool:
