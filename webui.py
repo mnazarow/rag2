@@ -101,6 +101,33 @@ def pipeline_state() -> dict:
     return {"stages": stages, "recent": recent, "jobs": running_jobs()}
 
 
+def extract_errors(limit: int = 300) -> dict:
+    """Файлы, из которых не удалось достать текст, — с причинами.
+
+    Раньше эти документы были видны только числом в сводке: чтобы узнать,
+    ЧТО именно не проиндексировалось и почему, приходилось лезть в базу
+    руками. Список с причинами превращает «где-то 14 ошибок» в план
+    работ: битые файлы заменить, запароленные — разблокировать, редкие
+    форматы — конвертировать.
+    """
+    def reason(text: str) -> str:
+        first = (text or "неизвестная ошибка").strip().splitlines()[0]
+        return first[:160]
+
+    rows = [dict(r) for r in db.q(
+        "SELECT rel_path, ext, error, indexed_at FROM documents "
+        "WHERE status='error' ORDER BY indexed_at DESC, id DESC LIMIT ?",
+        (limit,))]
+    total = db.q1("SELECT COUNT(*) n FROM documents WHERE status='error'")["n"]
+    by_reason: dict[str, int] = {}
+    for r in rows:
+        r["reason"] = reason(r.get("error"))
+        by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
+    top = sorted(by_reason.items(), key=lambda kv: -kv[1])
+    return {"total": total, "shown": len(rows), "errors": rows,
+            "by_reason": [{"reason": k, "count": v} for k, v in top[:12]]}
+
+
 # ------------------------------------------------------------ фоновые задачи --
 def start_job(name: str, fn, *args, **kwargs) -> str:
     """Запускает длительную операцию в фоне и показывает её ход в интерфейсе."""
@@ -750,6 +777,16 @@ svg{display:block;width:100%}
   <h2>Последние события</h2>
   <table id="events"><thead><tr><th>Время</th><th>Этап</th><th>Статус</th>
     <th>Подробности</th></tr></thead><tbody></tbody></table>
+
+  <h2>Ошибки извлечения</h2>
+  <p class="muted">Файлы, из которых не удалось достать текст: они не попали в
+    индекс, и ассистент про них не знает. Причина подсказывает, что делать:
+    битый файл — заменить у поставщика, запароленный — снять пароль,
+    редкий формат — конвертировать. После исправления файла индексация
+    подхватит его сама.</p>
+  <div class="panel" id="exErrSummary">Загружаю…</div>
+  <table id="exErrs"><thead><tr><th>Файл</th>
+    <th style="width:45%">Причина</th></tr></thead><tbody></tbody></table>
 </section>
 
 <section id="quick" class="on">
@@ -1651,6 +1688,24 @@ async function refreshFlow(){
        ${j.error?'<div class="bad">'+esc(String(j.error).slice(0,200))+'</div>':''}</td>
      <td>${act}</td></tr>`;}).join('')
      || '<tr><td colspan="5" class="muted">Задач пока не было.</td></tr>';
+  loadExtractErrors();
+}
+async function loadExtractErrors(){
+  const d=await (await fetch('/api/extract/errors')).json();
+  if(!d.total){
+    $('exErrSummary').innerHTML='<span class="good">Ошибок извлечения нет — все файлы разобраны.</span>';
+    document.querySelector('#exErrs tbody').innerHTML='';
+    return;
+  }
+  $('exErrSummary').innerHTML=
+    `<b class="bad">Файлов с ошибками: ${d.total}</b>`+
+    (d.shown<d.total?` <span class="muted">(показаны последние ${d.shown})</span>`:'')+
+    '<div style="margin-top:6px">'+d.by_reason.map(r=>
+      `<span class="muted" style="margin-right:12px">${esc(r.reason)} — <b>${r.count}</b></span>`).join('')+'</div>';
+  document.querySelector('#exErrs tbody').innerHTML=d.errors.map(e=>
+    `<tr><td title="${esc(e.rel_path)}">${esc(e.rel_path)}
+       <div class="muted" style="font-size:11px">${esc(e.ext||'')} · ${(e.indexed_at||'').replace('T',' ').slice(0,16)}</div></td>
+     <td class="bad" title="${esc(e.error||'')}">${esc(e.reason)}</td></tr>`).join('');
 }
 setInterval(()=>{ if($('flow').classList.contains('on')) refreshFlow(); },2500);
 setInterval(()=>{ if($('overview').classList.contains('on')) refreshOverview(); },15000);
@@ -3653,6 +3708,9 @@ class Handler(BaseHTTPRequestHandler):
             import jobs
             return self._json(self._safe_job(
                 jobs.get(int(query.get("id", ["0"])[0]))))
+
+        if path == "/api/extract/errors":
+            return self._json(extract_errors())
 
         if path == "/api/adminlog":
             return self._json({"entries": audit_log(

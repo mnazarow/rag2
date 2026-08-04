@@ -174,6 +174,55 @@ class TestBackup(Isolated):
         self.assertIn(kept[0], backup.archives())
 
 
+class TestExtractErrors(Isolated):
+    """Список файлов с ошибками извлечения — с причинами, а не числом."""
+
+    def _doc(self, rel, status="error", error=None):
+        self.db.run(
+            "INSERT INTO documents (rel_path, abs_path, file_name, ext, "
+            "content_hash, status, error, indexed_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rel, "/kb/" + rel, rel.rsplit("/", 1)[-1], ".pdf", rel,
+             status, error, "2026-08-04T00:00:00"))
+
+    def test_lists_errors_with_reasons(self):
+        import webui
+        self._doc("Р/Д/битый.pdf", error="файл повреждён: EOF marker not found")
+        self._doc("Р/Д/паролька.pdf", error="PDF зашифрован, нужен пароль")
+        self._doc("Р/Д/хороший.pdf", status="ok")
+        out = webui.extract_errors()
+        self.assertEqual(out["total"], 2)
+        paths = {e["rel_path"] for e in out["errors"]}
+        self.assertEqual(paths, {"Р/Д/битый.pdf", "Р/Д/паролька.pdf"})
+        reasons = {e["reason"] for e in out["errors"]}
+        self.assertIn("PDF зашифрован, нужен пароль", reasons)
+
+    def test_groups_by_reason_and_truncates(self):
+        import webui
+        for i in range(3):
+            self._doc(f"Р/Д/f{i}.pdf", error="одна и та же причина\nдетали")
+        self._doc("Р/Д/другая.pdf", error="x" * 500)
+        out = webui.extract_errors()
+        top = out["by_reason"][0]
+        self.assertEqual(top["reason"], "одна и та же причина")
+        self.assertEqual(top["count"], 3)
+        # Причина — первая строка, не длиннее 160 знаков.
+        self.assertTrue(all(len(r["reason"]) <= 160 for r in out["errors"]))
+
+    def test_empty_reason_named_honestly(self):
+        import webui
+        self._doc("Р/Д/пусто.pdf", error=None)
+        out = webui.extract_errors()
+        self.assertEqual(out["errors"][0]["reason"], "неизвестная ошибка")
+
+    def test_ui_wired(self):
+        from tests.base import ROOT
+        src = (ROOT / "webui.py").read_text(encoding="utf-8")
+        for needle in ('"/api/extract/errors"', "loadExtractErrors",
+                       'id="exErrs"', 'id="exErrSummary"',
+                       "Ошибки извлечения"):
+            self.assertIn(needle, src, needle)
+
+
 class TestJobQueue(Isolated):
     def setUp(self):
         super().setUp()
