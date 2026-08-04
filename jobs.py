@@ -58,6 +58,8 @@ RESOURCES: dict[str, tuple[str, ...]] = {
     # Смена провайдера: качает веса, может обучать модель и целиком
     # перезаписывает векторы — держит все три ресурса.
     "embed_switch":  ("vectors", "model", "models"),
+    # Смена генерации: качает веса и перезапускает сервер модели.
+    "llm_switch":    ("model", "models"),
     "ocr":           ("index", "vectors"),
     "ocr_retry":     ("index", "vectors"),
     "media":         ("index", "vectors"),

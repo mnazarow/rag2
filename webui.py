@@ -2378,6 +2378,10 @@ function settingCard(s,id){
   if(s.type==='bool') field=`<input type="checkbox" id="${id}" ${['True','1','true'].includes(String(s.value))?'checked':''}>`;
   else if(s.type==='enum') field=`<select id="${id}">${(s.options||[]).map(o=>
     `<option ${String(s.value)===o?'selected':''}>${esc(o)}</option>`).join('')}</select>`;
+  else if(s.type==='suggest') field=`<input id="${id}" type="text" list="${id}_dl"
+    value="${esc(s.value)}" placeholder="выберите из списка или впишите своё">
+    <datalist id="${id}_dl">${(s.options||[]).map(o=>
+      `<option value="${esc(o)}">`).join('')}</datalist>`;
   else field=`<input id="${id}" type="${s.type==='secret'?'password':'text'}"
     value="${s.type==='secret'?'':esc(s.value)}"
     placeholder="${s.type==='secret'?(s.filled?'ключ задан — впишите новый, чтобы заменить':'не задан'):''}">`;
@@ -4117,30 +4121,69 @@ class Handler(BaseHTTPRequestHandler):
             # («не заполнен ONNX_MODEL_PATH»), но требовало от человека
             # ручной подготовки. Делегируем задаче embed_switch — она
             # готовит всё сама и сохраняет настройку только после успеха.
-            note = ""
-            new_prov = str(values.get("EMBEDDINGS_PROVIDER", "")).strip()
-            if new_prov and new_prov != config.EMBEDDINGS_PROVIDER:
-                values.pop("EMBEDDINGS_PROVIDER", None)
-                emb_model = str(values.get("EMBEDDINGS_MODEL", "")).strip() or None
+            notes: list[str] = []
+
+            def _delegate(kind: str, title: str, payload_job: dict,
+                          what: str) -> None:
                 import handlers  # noqa: F401 — регистрация обработчиков
                 import jobs
                 jobs.start_worker()
                 try:
-                    job = jobs.enqueue(
-                        "embed_switch", "смена провайдера смыслового поиска",
-                        {"provider": new_prov, "model": emb_model}, wait=True)
-                    audit("задача", "смена провайдера смыслового поиска",
-                          {"provider": new_prov})
+                    job = jobs.enqueue(kind, title, payload_job, wait=True)
+                    audit("задача", title, payload_job)
                     busy = busy_with_indexing()
-                    note = (f"Провайдер смыслового поиска переключается на "
-                            f"«{new_prov}» отдельной задачей №{job['id']}: она "
-                            f"сама установит пакеты, скачает и подготовит "
-                            f"модель, проверит её, сохранит настройку и "
-                            f"пересчитает векторы. Ход — в разделе «Конвейер»."
-                            + (f" Сейчас выполняется «{busy}» — переключение "
-                               f"начнётся сразу после неё." if busy else ""))
+                    notes.append(
+                        f"{what} — отдельной задачей №{job['id']}: она сама "
+                        f"скачает и подготовит всё нужное, проверит модель "
+                        f"пробным запросом и только после успеха сохранит "
+                        f"настройку. Ход — в разделе «Конвейер»."
+                        + (f" Сейчас выполняется «{busy}» — задача начнётся "
+                           f"сразу после неё." if busy else ""))
                 except jobs.Busy as exc:
-                    note = f"Провайдер смыслового поиска не переключён: {exc}"
+                    notes.append(f"{what}: не поставлено — {exc}")
+
+            # Смысловой поиск: смена провайдера ИЛИ модели.
+            new_prov = str(values.get("EMBEDDINGS_PROVIDER", "")).strip()
+            new_emb_model = str(values.get("EMBEDDINGS_MODEL", "")).strip()
+            prov_changed = new_prov and new_prov != config.EMBEDDINGS_PROVIDER
+            model_changed = ("EMBEDDINGS_MODEL" in values
+                             and new_emb_model != str(config.EMBEDDINGS_MODEL or ""))
+            if prov_changed or model_changed:
+                values.pop("EMBEDDINGS_PROVIDER", None)
+                values.pop("EMBEDDINGS_MODEL", None)
+                target = new_prov or config.EMBEDDINGS_PROVIDER
+                _delegate("embed_switch", "смена провайдера смыслового поиска",
+                          {"provider": target, "model": new_emb_model or None},
+                          f"Смысловой поиск переключается на «{target}»"
+                          + (f" с моделью «{new_emb_model}»"
+                             if new_emb_model else ""))
+
+            # Генерация: смена провайдера, облачной или локальной модели.
+            new_llm = str(values.get("LLM_PROVIDER", "")).strip()
+            new_cloud = str(values.get("LLM_MODEL", "")).strip()
+            new_local = str(values.get("LOCAL_LLM_MODEL", "")).strip()
+            llm_prov_changed = new_llm and new_llm != config.LLM_PROVIDER
+            cloud_changed = ("LLM_MODEL" in values
+                             and new_cloud != str(config.LLM_MODEL or ""))
+            local_changed = ("LOCAL_LLM_MODEL" in values and new_local
+                             and new_local != str(config.LOCAL_LLM_MODEL or ""))
+            if llm_prov_changed or cloud_changed or local_changed:
+                values.pop("LLM_PROVIDER", None)
+                target = new_llm or config.LLM_PROVIDER
+                model_arg = None
+                if target == "local":
+                    if local_changed:
+                        values.pop("LOCAL_LLM_MODEL", None)
+                        model_arg = new_local
+                else:
+                    values.pop("LLM_MODEL", None)
+                    if cloud_changed:
+                        model_arg = new_cloud
+                _delegate("llm_switch", "смена модели генерации",
+                          {"provider": target, "model": model_arg},
+                          f"Генерация переключается на «{target}»"
+                          + (f" с моделью «{model_arg}»" if model_arg else ""))
+            note = " ".join(notes)
             issues = settings_schema.validate(values, full=env_with_secrets())
             errors = [i for i in issues if i["level"] == "error"]
             warnings = [i for i in issues if i["level"] == "warning"]
@@ -4254,6 +4297,7 @@ class Handler(BaseHTTPRequestHandler):
                 "train_lsa": "обучение смысловой модели",
                 "reembed": "пересчёт векторов",
                 "embed_switch": "смена провайдера смыслового поиска",
+                "llm_switch": "смена модели генерации",
                 "ocr": "распознавание сканов",
                 "ocr_retry": "повтор распознавания",
                 "backup": "резервная копия",
@@ -4278,7 +4322,7 @@ class Handler(BaseHTTPRequestHandler):
             # Смена провайдера поиска умеет ждать: во время многочасовой
             # переиндексации отказ «дождитесь окончания» означал бы, что
             # провайдера не сменить практически никогда.
-            waits = kind == "embed_switch"
+            waits = kind in ("embed_switch", "llm_switch")
             try:
                 job = jobs.enqueue(kind, titles[kind], payload_clean, wait=waits)
             except jobs.Busy as exc:

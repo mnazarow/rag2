@@ -153,7 +153,9 @@ $tools = @(
   @{ Cmd = "pdftotext"; Why = "разбор PDF, если не встанет PyMuPDF"; Pkg = "oschwartz10612.Poppler" },
   @{ Cmd = "git";       Why = "обновления"; Pkg = "Git.Git" },
   @{ Cmd = "tesseract"; Why = "распознавание сканов сертификатов"; Pkg = "UB-Mannheim.TesseractOCR" },
-  @{ Cmd = "ollama";    Why = "запуск локальных моделей"; Pkg = "Ollama.Ollama" }
+  @{ Cmd = "ollama";    Why = "запуск локальных моделей"; Pkg = "Ollama.Ollama" },
+  @{ Cmd = "ODAFileConverter"; Why = "чтение чертежей DWG"; Pkg = "OpenDesignAlliance.ODAFileConverter" },
+  @{ Cmd = "freecadcmd"; Why = "чтение моделей STEP и IGES"; Pkg = "FreeCAD.FreeCAD" }
 )
 $missing = @()
 foreach ($t in $tools) {

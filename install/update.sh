@@ -304,6 +304,56 @@ else
   fi
 fi
 
+# Инструменты для чертежей: доставляем, если их ещё нет, и прописываем
+# пути в .env (не перебивая значения, заданные рукой). Установка могла
+# пройти до того, как они появились в установщике.
+find_oda() {
+  command -v ODAFileConverter 2>/dev/null && return 0
+  ls -d /Applications/ODA*File*Converter*.app/Contents/MacOS/ODAFileConverter \
+        /usr/bin/ODAFileConverter /opt/ODA*/ODAFileConverter 2>/dev/null | head -1
+}
+find_freecad() {
+  command -v freecadcmd 2>/dev/null && return 0
+  command -v FreeCADCmd 2>/dev/null && return 0
+  ls -d /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \
+        /usr/bin/freecadcmd /snap/bin/freecad.cmd 2>/dev/null | head -1
+}
+set_env_default() {
+  local key="$1" value="$2" env_file="$TARGET/.env"
+  [ -f "$env_file" ] || return 0
+  if grep -q "^${key}=..*" "$env_file" 2>/dev/null; then return 0; fi
+  if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$env_file" && rm -f "$env_file.bak"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+  ok "$key прописан в .env: $value"
+}
+say "Проверяю инструменты для чертежей"
+if [ -z "$(find_oda || true)" ]; then
+  if [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+    brew install --cask oda-file-converter >/dev/null 2>&1 \
+      && ok "ODA File Converter установлен" \
+      || warn "ODA File Converter не поставился: opendesign.com/guestfiles/oda_file_converter"
+  else
+    warn "ODA File Converter (DWG->DXF) ставится вручную: opendesign.com/guestfiles/oda_file_converter"
+  fi
+else ok "ODA File Converter уже установлен"; fi
+if [ -z "$(find_freecad || true)" ]; then
+  if [ "$(uname -s)" = Darwin ] && command -v brew >/dev/null 2>&1; then
+    brew install --cask freecad >/dev/null 2>&1 && ok "FreeCAD установлен" \
+      || warn "FreeCAD не поставился: brew install --cask freecad"
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get install -y freecad >/dev/null 2>&1 && ok "FreeCAD установлен" \
+      || warn "FreeCAD не поставился: apt-get install freecad"
+  else
+    warn "FreeCAD ставится вручную: freecad.org/downloads.php"
+  fi
+else ok "FreeCAD уже установлен"; fi
+ODA_FOUND="$(find_oda || true)"; FREECAD_FOUND="$(find_freecad || true)"
+[ -n "$ODA_FOUND" ] && set_env_default ODA_CONVERTER "$ODA_FOUND"
+[ -n "$FREECAD_FOUND" ] && set_env_default FREECAD_CMD "$FREECAD_FOUND"
+
 say "Проверяю совместимость данных"
 "$TARGET/venv/bin/python" -c "
 import sys; sys.path.insert(0, '$TARGET')

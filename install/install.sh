@@ -370,6 +370,68 @@ install_ollama() {
   fi
 }
 install_ollama
+
+# Инструменты для чертежей: ODA File Converter (DWG -> DXF) и FreeCAD
+# (STEP/IGES). Без них чертежи остаются находимыми только по имени файла.
+# Найденные пути прописываются в .env сами — не перебивая заданное рукой.
+find_oda() {
+  command -v ODAFileConverter 2>/dev/null && return 0
+  ls -d /Applications/ODA*File*Converter*.app/Contents/MacOS/ODAFileConverter \
+        /usr/bin/ODAFileConverter /opt/ODA*/ODAFileConverter 2>/dev/null | head -1
+}
+find_freecad() {
+  command -v freecadcmd 2>/dev/null && return 0
+  command -v FreeCADCmd 2>/dev/null && return 0
+  ls -d /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd \
+        /usr/bin/freecadcmd /snap/bin/freecad.cmd 2>/dev/null | head -1
+}
+install_cad_tools() {
+  [ "$WITH_PACKAGES" = 1 ] || { warn "инструменты чертежей не ставлю (--no-packages)"; return 0; }
+  if [ -z "$(find_oda || true)" ]; then
+    if [ "$PLATFORM" = macos ] && command -v brew >/dev/null 2>&1; then
+      say "Ставлю ODA File Converter — чтение чертежей DWG"
+      run "brew install --cask oda-file-converter" \
+        || warn "ODA File Converter не поставился: скачайте с opendesign.com/guestfiles/oda_file_converter"
+    else
+      warn "ODA File Converter (DWG->DXF) ставится вручную: opendesign.com/guestfiles/oda_file_converter"
+    fi
+  else ok "ODA File Converter уже установлен"; fi
+  if [ -z "$(find_freecad || true)" ]; then
+    if [ "$PLATFORM" = macos ] && command -v brew >/dev/null 2>&1; then
+      say "Ставлю FreeCAD — чтение моделей STEP и IGES"
+      run "brew install --cask freecad" \
+        || warn "FreeCAD не поставился: brew install --cask freecad"
+    elif command -v apt-get >/dev/null 2>&1; then
+      say "Ставлю FreeCAD — чтение моделей STEP и IGES"
+      run "${SUDO:-} apt-get install -y freecad" \
+        || warn "FreeCAD не поставился: apt-get install freecad"
+    else
+      warn "FreeCAD ставится вручную: freecad.org/downloads.php"
+    fi
+  else ok "FreeCAD уже установлен"; fi
+}
+install_cad_tools
+
+# Прописать путь в .env, не перебивая значение, заданное человеком.
+set_env_default() {  # set_env_default КЛЮЧ ЗНАЧЕНИЕ
+  local key="$1" value="$2" env_file="$TARGET/.env"
+  [ -f "$env_file" ] || return 0
+  if grep -q "^${key}=..*" "$env_file" 2>/dev/null; then return 0; fi
+  if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$env_file" && rm -f "$env_file.bak"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$env_file"
+  fi
+  ok "$key прописан в .env: $value"
+}
+configure_cad_env() {
+  local oda freecad
+  oda="$(find_oda || true)"; freecad="$(find_freecad || true)"
+  [ -n "$oda" ] && set_env_default ODA_CONVERTER "$oda"
+  [ -n "$freecad" ] && set_env_default FREECAD_CMD "$freecad"
+  return 0
+}
+
 if [ "$WITH_GPU" = 1 ]; then
   say "Ставлю библиотеки для локальных моделей — это долго и займёт несколько гигабайт"
   run "'$VENV_PY' -m pip install --quiet sentence-transformers faster-whisper" || \
@@ -385,6 +447,8 @@ else ok ".env уже есть, не перезаписываю"; fi
 # В .env будет токен бота, в data/ — вопросы сотрудников: только владельцу.
 run "chmod 600 '$TARGET/.env' 2>/dev/null || true"
 run "chmod 700 '$TARGET/data' 2>/dev/null || true"
+# Пути к инструментам чертежей — теперь, когда .env существует.
+configure_cad_env
 
 if [ "$WITH_NETWORK" = 1 ]; then
   # Доступ из сети. Наружу без входа нельзя — админка управляет всей

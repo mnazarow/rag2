@@ -100,6 +100,16 @@ def _reembed(payload: dict, progress) -> dict:
     return result
 
 
+@jobs.handler("llm_switch")
+def _llm_switch(payload: dict, progress) -> dict:
+    """Смена провайдера/модели генерации под ключ: скачивание, запуск,
+    пробный вопрос, сохранение настроек — с откатом при неудаче."""
+    import llm_setup
+    return llm_setup.switch(payload.get("provider") or "",
+                            model=payload.get("model"),
+                            progress=progress)
+
+
 @jobs.handler("embed_switch")
 def _embed_switch(payload: dict, progress) -> dict:
     """Смена провайдера смыслового поиска под ключ.
