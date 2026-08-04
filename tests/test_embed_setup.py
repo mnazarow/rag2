@@ -120,6 +120,23 @@ class TestSwitch(Isolated):
         self.assertIn("local", text)          # более простой путь назван
         self.assertIn("не изменены", text)
 
+    def test_onnx_autoconverts_when_possible(self):
+        """Выбор onnx без готового файла: модель конвертируется сама,
+        путь прописывается в ONNX_MODEL_PATH — ручной подготовки нет."""
+        import embeddings
+        onnx_file = self.tmp / "user-bge-m3-onnx" / "model.onnx"
+        onnx_file.parent.mkdir(parents=True)
+        onnx_file.write_bytes(b"onnx")
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(embed_setup, "_has_module",
+                                               return_value=True))
+            st.enter_context(mock.patch.object(
+                embed_setup, "_export_onnx", return_value=str(onnx_file)))
+            st.enter_context(mock.patch.object(embeddings, "get_embedder",
+                                               return_value=FakeEmbedder()))
+            result = embed_setup.switch("onnx", persist=False)
+        self.assertEqual(result["updates"]["ONNX_MODEL_PATH"], str(onnx_file))
+
     def test_persist_writes_settings(self):
         import webui
         with contextlib.ExitStack() as st:
@@ -156,7 +173,10 @@ class TestWiring(unittest.TestCase):
         from tests.base import ROOT
         src = (ROOT / "webui.py").read_text(encoding="utf-8")
         for needle in ('"embed_switch"', "switchEmb", 'id="reProv"',
-                       "Переключить провайдера", "env_with_secrets"):
+                       "Переключить провайдера", "env_with_secrets",
+                       # Смена провайдера из формы настроек делегируется
+                       # задаче, а не падает на «не заполнен ONNX_MODEL_PATH».
+                       "отдельной задачей", "if(r.note) alert(r.note)"):
             self.assertIn(needle, src, needle)
         handlers_src = (ROOT / "handlers.py").read_text(encoding="utf-8")
         self.assertIn('@jobs.handler("embed_switch")', handlers_src)

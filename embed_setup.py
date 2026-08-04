@@ -136,11 +136,63 @@ def _ensure_local_weights(name: str, say) -> str:
     return spec.repo
 
 
+def _export_onnx(repo: str, say) -> str | None:
+    """Конвертирует модель в onnx сама: optimum-cli export onnx.
+
+    Возвращает путь к model.onnx или None — тогда вызывающая сторона
+    объяснит запасные пути. Все шаги — установка optimum, скачивание,
+    конвертация — идут в журнал задачи строка за строкой.
+    """
+    target = Path(config.MODELS_DIR) / (repo.split("/")[-1].lower() + "-onnx")
+    found = sorted(target.rglob("*.onnx")) if target.exists() else []
+    if found:
+        say(f"Конвертированная копия уже есть: {found[0]}")
+        return str(found[0])
+    if not _has_module("optimum"):
+        try:
+            _pip_install(["optimum[exporters]"], say)
+        except RuntimeError as exc:
+            say(f"Не удалось поставить optimum: {exc}")
+            return None
+    cli = Path(sys.executable).parent / "optimum-cli"
+    cmd = ([str(cli)] if cli.exists() else ["optimum-cli"]) + \
+        ["export", "onnx", "--model", repo, str(target)]
+    env = dict(os.environ)
+    if config.HF_MIRROR:
+        env["HF_ENDPOINT"] = config.HF_MIRROR
+        say(f"Скачивание пойдёт через зеркало {config.HF_MIRROR}")
+    say(f"Конвертирую «{repo}» в onnx — разовая операция на несколько минут…")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env)
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.rstrip()
+            if line:
+                say(line[-200:])
+        proc.wait(timeout=3600)
+    except FileNotFoundError:
+        say("Команда optimum-cli не нашлась после установки optimum.")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        say(f"Конвертация не удалась: {exc}")
+        return None
+    if proc.returncode != 0:
+        say(f"Конвертация не удалась (код {proc.returncode}) — "
+            f"подробности в строках выше.")
+        return None
+    found = sorted(target.rglob("*.onnx"))
+    if found:
+        say(f"Модель сконвертирована: {found[0]}")
+        return str(found[0])
+    say("Конвертация закончилась без ошибок, но файла .onnx не появилось.")
+    return None
+
+
 def _ensure_onnx_model(model: str | None, say) -> str | None:
-    """Файл model.onnx: берём указанный, ищем скачанный, качаем из каталога.
+    """Файл model.onnx: указанный, скачанный, из каталога — или конвертируем.
 
     Возвращает путь для ONNX_MODEL_PATH или None, если путь уже задан
-    и существует. Если файла нет и взять неоткуда — честная ошибка с
+    и существует. Если файла нет и добыть не вышло — честная ошибка с
     планом действий.
     """
     import models
@@ -168,13 +220,21 @@ def _ensure_onnx_model(model: str | None, say) -> str | None:
     if found:
         say(f"Нашёл готовый onnx-файл среди скачанных моделей: {found[0]}")
         return str(found[0])
+    # Готового нет нигде — конвертируем сами. Это и есть «скачивается и
+    # устанавливается само»: optimum скачает веса и выгрузит их в onnx.
+    repo = model or config.EMBEDDINGS_MODEL or DEFAULT_LOCAL_MODEL
+    spec = _catalog_spec(repo)
+    exported = _export_onnx(spec.repo if spec else repo, say)
+    if exported:
+        return exported
     raise RuntimeError(
-        "для провайдера onnx нужен файл model.onnx, а его нет. Варианты: "
-        "1) выбрать провайдер «local» — он использует те же модели без "
-        "конвертации и всё скачает сам; 2) на машине с интернетом выполнить "
-        "`optimum-cli export onnx --model deepvk/USER-bge-m3 ./user-bge-m3-onnx`, "
-        "перенести папку на сервер и указать путь в ONNX_MODEL_PATH. "
-        "Настройки не изменены.")
+        "для провайдера onnx нужен файл model.onnx: автоматическая "
+        "конвертация не удалась (подробности — в журнале задачи выше). "
+        "Варианты: 1) выбрать провайдер «local» — он использует те же "
+        "модели без конвертации и всё скачает сам; 2) на машине с "
+        "интернетом выполнить `optimum-cli export onnx --model "
+        "deepvk/USER-bge-m3 ./user-bge-m3-onnx`, перенести папку на "
+        "сервер и указать путь в ONNX_MODEL_PATH. Настройки не изменены.")
 
 
 def switch(provider: str, model: str | None = None, progress=None,

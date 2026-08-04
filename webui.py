@@ -2435,9 +2435,11 @@ async function submitSettings(payload, statusId, force){
       ? `<div class="panel">${issuesHtml(r.issues)}</div>` : '';
     if(statusId&&$(statusId)){ $(statusId).textContent='Сохранено';
       setTimeout(()=>$(statusId).textContent='',3000); }
+    if(r.note) alert(r.note);
     if(r.changed&&r.changed.length) loadSettings();
     return true;
   }
+  if(r.note) alert(r.note);
   const html=`<div class="panel">${issuesHtml(r.issues)}</div>`;
   if(box) box.innerHTML=html;
   if(r.errors){
@@ -4051,6 +4053,36 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             values = {k: v for k, v in payload.items() if k != "force"}
+            # Смена провайдера смыслового поиска — не «записать строчку»,
+            # а целый сценарий: пакеты, веса, конвертация, проверка,
+            # пересчёт векторов. Прямое сохранение здесь честно падало
+            # («не заполнен ONNX_MODEL_PATH»), но требовало от человека
+            # ручной подготовки. Делегируем задаче embed_switch — она
+            # готовит всё сама и сохраняет настройку только после успеха.
+            note = ""
+            new_prov = str(values.get("EMBEDDINGS_PROVIDER", "")).strip()
+            if new_prov and new_prov != config.EMBEDDINGS_PROVIDER:
+                values.pop("EMBEDDINGS_PROVIDER", None)
+                emb_model = str(values.get("EMBEDDINGS_MODEL", "")).strip() or None
+                import handlers  # noqa: F401 — регистрация обработчиков
+                import jobs
+                jobs.start_worker()
+                try:
+                    job = jobs.enqueue(
+                        "embed_switch", "смена провайдера смыслового поиска",
+                        {"provider": new_prov, "model": emb_model}, wait=True)
+                    audit("задача", "смена провайдера смыслового поиска",
+                          {"provider": new_prov})
+                    busy = busy_with_indexing()
+                    note = (f"Провайдер смыслового поиска переключается на "
+                            f"«{new_prov}» отдельной задачей №{job['id']}: она "
+                            f"сама установит пакеты, скачает и подготовит "
+                            f"модель, проверит её, сохранит настройку и "
+                            f"пересчитает векторы. Ход — в разделе «Конвейер»."
+                            + (f" Сейчас выполняется «{busy}» — переключение "
+                               f"начнётся сразу после неё." if busy else ""))
+                except jobs.Busy as exc:
+                    note = f"Провайдер смыслового поиска не переключён: {exc}"
             issues = settings_schema.validate(values, full=env_with_secrets())
             errors = [i for i in issues if i["level"] == "error"]
             warnings = [i for i in issues if i["level"] == "warning"]
@@ -4058,7 +4090,7 @@ class Handler(BaseHTTPRequestHandler):
             # не запустится, а связать поломку с давней правкой уже трудно.
             # Предупреждения — сохраняем, но только после подтверждения.
             if errors or (warnings and not payload.get("force")):
-                return self._json({"ok": False, "issues": issues,
+                return self._json({"ok": False, "issues": issues, "note": note,
                                    "errors": len(errors), "warnings": len(warnings)},
                                   200)
             before = read_env()
@@ -4098,7 +4130,7 @@ class Handler(BaseHTTPRequestHandler):
                   _audit_safe_changes(changed, before))
             _reload_after_settings(changed)
             return self._json({"ok": True, "changed": sorted(changed),
-                               "issues": issues})
+                               "issues": issues, "note": note})
 
         if path == "/api/settings/reset":
             # Вернуть настройку к значению по умолчанию. Без этой кнопки
