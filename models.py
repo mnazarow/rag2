@@ -466,12 +466,10 @@ def is_installed(spec: ModelSpec) -> bool:
     if path.exists() and any(path.rglob("*.safetensors")):
         return True
     if spec.ollama_tag and shutil.which("ollama"):
-        try:
-            out = subprocess.run(["ollama", "list"], capture_output=True,
-                                 text=True, timeout=15).stdout
-            return spec.ollama_tag.split(":")[0] in out
-        except Exception:  # noqa: BLE001
-            return False
+        # Точное имя, а не совпадение по началу: qwen3.6:27b на диске
+        # не означает, что qwen3.6:35b «установлена».
+        tags = _ollama_tags()
+        return bool(tags) and any(_tag_eq(spec.ollama_tag, t) for t in tags)
     return False
 
 
@@ -652,16 +650,64 @@ def download_progress() -> dict | None:
     return state
 
 
-def _ollama_has(tag: str) -> bool:
-    """Загружены ли веса этой модели в ollama."""
+def _tag_eq(a: str, b: str) -> bool:
+    """Одно ли это имя модели ollama: «x» и «x:latest» — одно и то же."""
+    norm = lambda t: t if ":" in t else t + ":latest"  # noqa: E731
+    return norm(a) == norm(b)
+
+
+def _ollama_tags() -> list[str] | None:
+    """Какие модели знает сервер ollama. None — выяснить не удалось.
+
+    Сначала спрашиваем сам сервер (/api/tags): именно он будет отвечать
+    на вопросы, и его список — истина. Команда `ollama list` — запасной
+    путь на случай, когда сервер ещё не поднят.
+    """
+    try:
+        import httpx
+        r = httpx.get("http://127.0.0.1:11434/api/tags", timeout=3)
+        if r.status_code == 200:
+            return [m.get("name", "") for m in r.json().get("models", [])]
+    except Exception:  # noqa: BLE001
+        pass
     try:
         out = subprocess.run(["ollama", "list"], capture_output=True,
                              text=True, timeout=10).stdout
-        base = tag.split(":")[0]
-        return any(line.split()[0].startswith(base) for line in
-                   out.strip().splitlines()[1:] if line.split())
-    except Exception:  # noqa: BLE001 — не смогли проверить: не мешаем запуску
+        return [line.split()[0] for line in out.strip().splitlines()[1:]
+                if line.split()]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ollama_has(tag: str) -> bool:
+    """Загружены ли веса ИМЕННО этой модели в ollama.
+
+    Сравнение точное: у пользователя может стоять qwen3.6:27b, а
+    запускается qwen3.6:35b — совпадение по началу имени здесь давало
+    «запустилось», за которым каждый вопрос падал с 404 от сервера.
+    """
+    tags = _ollama_tags()
+    if tags is None:            # не смогли проверить — не мешаем запуску
         return True
+    return any(_tag_eq(tag, t) for t in tags)
+
+
+def _server_knows(base_url: str, served: str) -> bool | None:
+    """Отдаёт ли сервер модель под этим именем. None — не смогли спросить.
+
+    Ответ «нет» — только когда сервер ЖИВ и определённо ответил списком
+    без нужного имени: на сетевые ошибки запуск не роняем (vllm, например,
+    поднимается минуты, и это нормально).
+    """
+    try:
+        import httpx
+        r = httpx.get(base_url.rstrip("/") + "/models", timeout=3)
+        if r.status_code != 200:
+            return None
+        names = [m.get("id", "") for m in r.json().get("data", [])]
+        return any(_tag_eq(served, n) for n in names)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _ollama_alive() -> bool:
@@ -748,11 +794,26 @@ def _serve(model_id: str, engine: str | None = None, port: int | None = None,
         # Кнопку «Запустить» жмут и до загрузки весов — это самый частый
         # случай. Честный отказ с планом действий лучше «запустилось», за
         # которым каждый вопрос отвечал бы ошибкой 404 от ollama.
-        if not _ollama_has(spec.ollama_tag):
-            raise RuntimeError(
-                f"веса «{spec.ollama_tag}» ещё не загружены в ollama. "
-                f"Нажмите «Скачать» в карточке модели (или выполните "
-                f"`ollama pull {spec.ollama_tag}`) и запустите снова.")
+        tags = _ollama_tags()
+        known = (any(_tag_eq(spec.ollama_tag, t) for t in tags)
+                 if tags is not None else _ollama_has(spec.ollama_tag))
+        if not known:
+            msg = (f"веса «{spec.ollama_tag}» ещё не загружены в ollama. "
+                   f"Нажмите «Скачать» в карточке модели (или выполните "
+                   f"`ollama pull {spec.ollama_tag}`) и запустите снова.")
+            base = spec.ollama_tag.split(":")[0]
+            siblings = [t for t in (tags or []) if t.split(":")[0] == base]
+            if siblings:
+                msg += (f" Обратите внимание: у сервера есть похожая — "
+                        f"{', '.join(siblings)}; возможно, вы хотели "
+                        f"запустить её (выберите её карточку в каталоге).")
+            if tags:
+                msg += (" Сейчас на сервере загружены: "
+                        + ", ".join(sorted(tags)[:8])
+                        + ("…" if len(tags) > 8 else "") + ".")
+            elif tags is not None:
+                msg += " Сейчас на сервере не загружено ни одной модели."
+            raise RuntimeError(msg)
         served = spec.ollama_tag
     elif engine == "vllm":
         if _apple_silicon():
@@ -786,11 +847,37 @@ def _serve(model_id: str, engine: str | None = None, port: int | None = None,
         logs = Path(config.LOG_DIR) / "model_server.log"
         logs.parent.mkdir(parents=True, exist_ok=True)
         proc = subprocess.Popen(cmd, stdout=logs.open("ab"), stderr=subprocess.STDOUT)
+        # Умереть сразу — типично: занят порт, кончилась видеопамять,
+        # битые веса. Ждать таймаута первого вопроса, чтобы это узнать,
+        # неправильно — проверяем сами и показываем, что написал сервер.
+        time.sleep(2.5)
+        if proc.poll() is not None:
+            tail = ""
+            try:
+                lines = logs.read_text(errors="replace").splitlines()
+                tail = "\n".join(lines[-15:])
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"сервер vllm завершился сразу после запуска "
+                f"(код {proc.returncode}). Последние строки его журнала:\n"
+                f"{tail or '(журнал пуст)'}")
         base_url = f"http://127.0.0.1:{port}/v1"
         served = spec.id
     else:
         raise RuntimeError(f"запуск через «{engine}» из интерфейса не поддерживается; "
                            "смотрите документацию по ручной установке")
+
+    # Последняя сверка перед привязкой: сервер, к которому пойдут вопросы,
+    # действительно отдаёт модель под этим именем. Ловит расхождения между
+    # `ollama list` и работающим сервером (другой демон, другой пользователь).
+    verdict = _server_knows(base_url, served)
+    if verdict is False:
+        raise RuntimeError(
+            f"сервер {base_url} работает, но модели «{served}» в его списке "
+            f"нет. Похоже, отвечает другой экземпляр сервера (не тот, куда "
+            f"загружены веса). Перезапустите приложение Ollama и попробуйте "
+            f"снова, либо выполните `ollama pull {served}`.")
 
     state = {"pid": proc.pid if proc else None, "model": spec.id, "engine": engine,
              "external": proc is None,

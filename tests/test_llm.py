@@ -324,7 +324,8 @@ class TestInstalledPicker(Isolated):
 class TestServeErrors(Isolated):
     """Кнопка «Запустить»: счастливый путь работает, отказы объясняют себя."""
 
-    def _mac_stack(self, st, has_ollama=True, alive=True, pulled=True):
+    def _mac_stack(self, st, has_ollama=True, alive=True, pulled=True,
+                   tags=None, knows=None):
         import platform
         from unittest import mock
 
@@ -340,6 +341,10 @@ class TestServeErrors(Isolated):
                                            return_value=alive))
         st.enter_context(mock.patch.object(models, "_ollama_has",
                                            return_value=pulled))
+        st.enter_context(mock.patch.object(models, "_ollama_tags",
+                                           return_value=tags))
+        st.enter_context(mock.patch.object(models, "_server_knows",
+                                           return_value=knows))
 
     def test_external_ollama_serve_does_not_crash(self):
         """Регрессия: запущенное приложение Ollama роняло serve на proc.pid."""
@@ -361,6 +366,73 @@ class TestServeErrors(Isolated):
             self._mac_stack(st, pulled=False)
             with self.assertRaisesRegex(RuntimeError, "ollama pull"):
                 models.serve("qwen3.6-27b", apply_config=False)
+
+    def test_wrong_size_names_sibling(self):
+        """Регрессия «не знает модель qwen3.6:35b»: скачана 27b, запускают
+        35b — раньше проверка по началу имени это пропускала, и каждый
+        вопрос падал с 404. Теперь честный отказ, называющий похожую."""
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st, tags=["qwen3.6:27b"])
+            with self.assertRaises(RuntimeError) as ctx:
+                models.serve("qwen3.6-35b-a3b", apply_config=False)
+        text = str(ctx.exception)
+        self.assertIn("qwen3.6:35b", text)          # чего не хватает
+        self.assertIn("ollama pull qwen3.6:35b", text)
+        self.assertIn("qwen3.6:27b", text)          # что есть похожего
+        self.assertIn("похожая", text)
+
+    def test_exact_tag_present_serves(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st, tags=["qwen3.6:27b", "qwen3:14b"])
+            state = models.serve("qwen3.6-27b", apply_config=False)
+        self.assertEqual(state["served_name"], "qwen3.6:27b")
+
+    def test_empty_server_says_so(self):
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st, tags=[])
+            with self.assertRaisesRegex(RuntimeError,
+                                        "ни одной модели"):
+                models.serve("qwen3.6-27b", apply_config=False)
+
+    def test_server_mismatch_detected_before_binding(self):
+        """Сервер жив, `ollama list` модель видит, а работающий сервер —
+        нет (другой демон): отказ до привязки, а не 404 на каждом вопросе."""
+        import contextlib
+
+        import models
+        with contextlib.ExitStack() as st:
+            self._mac_stack(st, tags=["qwen3.6:27b"], knows=False)
+            with self.assertRaisesRegex(RuntimeError, "другой экземпляр"):
+                models.serve("qwen3.6-27b", apply_config=False)
+        self.assertFalse(models._pid_file().exists())
+
+    def test_tag_eq_treats_latest_as_default(self):
+        import models
+        self.assertTrue(models._tag_eq("gemma3", "gemma3:latest"))
+        self.assertFalse(models._tag_eq("qwen3.6:27b", "qwen3.6:35b"))
+
+    def test_is_installed_requires_exact_tag(self):
+        import contextlib
+        from unittest import mock
+
+        import models
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(
+                models.shutil, "which", lambda x: "/x/ollama"))
+            st.enter_context(mock.patch.object(
+                models, "_ollama_tags", return_value=["qwen3.6:27b"]))
+            self.assertTrue(models.is_installed(models.BY_ID["qwen3.6-27b"]))
+            self.assertFalse(
+                models.is_installed(models.BY_ID["qwen3.6-35b-a3b"]))
 
     def test_vllm_model_on_mac_redirects_to_ollama_models(self):
         import contextlib
