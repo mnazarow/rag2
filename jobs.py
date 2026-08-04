@@ -60,6 +60,9 @@ RESOURCES: dict[str, tuple[str, ...]] = {
     "embed_switch":  ("vectors", "model", "models"),
     # Смена генерации: качает веса и перезапускает сервер модели.
     "llm_switch":    ("model", "models"),
+    # Автонастройка компонента (реранкер, сканы, зрение, речь, векторы):
+    # может качать модели.
+    "component_setup": ("models",),
     "ocr":           ("index", "vectors"),
     "ocr_retry":     ("index", "vectors"),
     "media":         ("index", "vectors"),
@@ -149,9 +152,13 @@ def enqueue(kind: str, title: str = "", payload: dict | None = None,
     reap_stale()
     # Активных задач всегда единицы, поэтому пересечение считаем в Python:
     # это понятнее любого условия в SQL и не зависит от формата хранения.
-    for row in db.q("SELECT id, kind, title, resource FROM jobs "
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    for row in db.q("SELECT id, kind, title, resource, payload_json FROM jobs "
                     "WHERE status IN ('queued','running')"):
-        if row["kind"] == kind:
+        # Дубль — это тот же вид задачи С ТЕМИ ЖЕ параметрами: две
+        # «настройки компонента» для разных настроек — не дубль, а
+        # очередь дел; второй щелчок по той же кнопке — дубль.
+        if row["kind"] == kind and (row["payload_json"] or "{}") == payload_json:
             raise Busy(
                 f"такая задача уже есть: {row['title'] or row['kind']} "
                 f"(№{row['id']}). Второй раз ставить не нужно — ход виден "

@@ -110,6 +110,16 @@ def _llm_switch(payload: dict, progress) -> dict:
                             progress=progress)
 
 
+@jobs.handler("component_setup")
+def _component_setup(payload: dict, progress) -> dict:
+    """Автонастройка компонента при смене настройки: пакеты, программы,
+    модели, проверка серверов — настройка сохраняется после успеха."""
+    import components
+    return components.switch(payload.get("key") or "",
+                             payload.get("value") or "",
+                             progress=progress)
+
+
 @jobs.handler("embed_switch")
 def _embed_switch(payload: dict, progress) -> dict:
     """Смена провайдера смыслового поиска под ключ.

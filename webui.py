@@ -4266,6 +4266,24 @@ class Handler(BaseHTTPRequestHandler):
                           {"provider": target, "model": model_arg},
                           f"Генерация переключается на «{target}»"
                           + (f" с моделью «{model_arg}»" if model_arg else ""))
+
+            # Остальные «провайдерные» настройки: реранкер, сканы, зрение,
+            # речь, хранилище векторов. Для каждой есть автонастройка —
+            # пакеты, программы и модели ставятся сами, настройка
+            # сохраняется только после успешной подготовки.
+            import components as components_mod
+            for comp_key in sorted(components_mod.KEYS):
+                if comp_key not in values:
+                    continue
+                comp_val = str(values[comp_key]).strip()
+                if comp_val == str(getattr(config, comp_key, "") or "").strip():
+                    continue
+                values.pop(comp_key)
+                _delegate("component_setup",
+                          f"настройка: {components_mod.title(comp_key)}",
+                          {"key": comp_key, "value": comp_val},
+                          f"{components_mod.title(comp_key)}: переключение "
+                          f"на «{comp_val}»")
             note = " ".join(notes)
             issues = settings_schema.validate(values, full=env_with_secrets())
             errors = [i for i in issues if i["level"] == "error"]
@@ -4381,6 +4399,7 @@ class Handler(BaseHTTPRequestHandler):
                 "reembed": "пересчёт векторов",
                 "embed_switch": "смена провайдера смыслового поиска",
                 "llm_switch": "смена модели генерации",
+                "component_setup": "настройка компонента",
                 "ocr": "распознавание сканов",
                 "ocr_retry": "повтор распознавания",
                 "backup": "резервная копия",
@@ -4405,7 +4424,7 @@ class Handler(BaseHTTPRequestHandler):
             # Смена провайдера поиска умеет ждать: во время многочасовой
             # переиндексации отказ «дождитесь окончания» означал бы, что
             # провайдера не сменить практически никогда.
-            waits = kind in ("embed_switch", "llm_switch")
+            waits = kind in ("embed_switch", "llm_switch", "component_setup")
             try:
                 job = jobs.enqueue(kind, titles[kind], payload_clean, wait=waits)
             except jobs.Busy as exc:
