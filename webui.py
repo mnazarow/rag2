@@ -158,6 +158,25 @@ def read_env() -> dict:
     return out
 
 
+def env_with_secrets() -> dict:
+    """Полная картина настроек для проверки связей между ними.
+
+    Ключи хранятся не в .env, а в защищённом файле. Проверка «для
+    GigaChat нужен ключ» по одному .env их не видела и запрещала
+    переключить провайдера даже с заполненным ключом — сохранение
+    отклонялось, и выбор «возвращался» к прежнему.
+    """
+    full = read_env()
+    try:
+        import security
+        for key, value in security.load_secrets().items():
+            if str(value).strip() and not str(full.get(key, "")).strip():
+                full[key] = str(value)
+    except Exception:  # noqa: BLE001 — нет файла ключей — нет и ключей
+        pass
+    return full
+
+
 # Ошибки, которые можно показать целиком: они говорят о действии
 # пользователя, а не об устройстве сервера.
 # RuntimeError здесь не случайно: наши собственные проверки («веса ещё
@@ -958,26 +977,28 @@ svg{display:block;width:100%}
   <h2>Смысловой канал</h2>
   <div class="panel" id="semPanel">Загружаю…</div>
   <div class="toolbar">
-    <button class="act" onclick="job('train_lsa')">Обучить модель на базе</button>
-    <button class="act sec" onclick="reembedWith()">Пересчитать векторы</button>
-    <select id="reProv" title="провайдер для пересчёта">
-      <option value="">текущий провайдер</option>
-      <option value="lsa">lsa — своя модель</option>
-      <option value="onnx">onnx — готовая модель</option>
-      <option value="local">local — sentence-transformers</option>
-      <option value="gigachat">gigachat</option>
-      <option value="yandex">yandex</option>
-      <option value="openai">openai-совместимый</option>
+    <select id="reProv" title="провайдер смыслового поиска">
+      <option value="">— выберите провайдера —</option>
+      <option value="lsa">lsa — своя модель, обучается на вашей базе</option>
+      <option value="local">local — готовая модель (USER-bge-m3), скачается сама</option>
+      <option value="onnx">onnx — готовая модель в формате onnx</option>
+      <option value="gigachat">gigachat — облако Сбера</option>
+      <option value="yandex">yandex — облако Яндекса</option>
+      <option value="openai">openai-совместимый сервер</option>
       <option value="hashing">hashing — заглушка</option>
     </select>
+    <button class="act" onclick="switchEmb()">Переключить провайдера</button>
+    <button class="act sec" onclick="job('train_lsa')">Обучить модель на базе</button>
+    <button class="act sec" onclick="job('reembed',{})">Пересчитать векторы</button>
   </div>
-  <p class="muted">Порядок при первом запуске: индексация → обучить модель →
-    пересчитать векторы. Пересчёт нужен и после смены провайдера: файлы
-    заново не разбираются, меняются только векторы, это минуты вместо часов.
-    Готовая модель (USER-bge-m3, BGE-M3) готовится на машине с интернетом
-    командой <code>optimum-cli export onnx --model deepvk/USER-bge-m3
-    ./user-bge-m3-onnx</code>, папка переносится на сервер, путь указывается
-    в ONNX_MODEL_PATH.</p>
+  <p class="muted">«Переключить провайдера» делает всё одной задачей:
+    ставит недостающие пакеты, скачивает веса (для local — модель
+    USER-bge-m3, дообученную под русский), при необходимости обучает свою
+    модель, проверяет провайдера пробным текстом, сохраняет настройки и
+    пересчитывает векторы. Если какой-то шаг не удался — настройки не
+    меняются, поиск продолжает работать как раньше, а причина видна в
+    разделе «Конвейер». Порядок при первом запуске остаётся прежним:
+    индексация → обучить модель → пересчитать векторы.</p>
 
   <h2>Переранжирование</h2>
   <div class="panel" id="rrPanel">Загружаю…</div>
@@ -1957,7 +1978,11 @@ async function loadSearch(){
   ].map(([k,v])=>`<div class="card${k==='Сбоев'&&v?' bad':''}">
     <div class="v">${RU(v)}</div><div class="k">${k}</div></div>`).join('');
 }
-function reembedWith(){ job('reembed',{provider:$('reProv').value||null}); }
+function switchEmb(){
+  const p=$('reProv').value;
+  if(!p){ alert('Сначала выберите провайдера в списке слева.'); return; }
+  job('embed_switch',{provider:p});
+}
 
 async function testSearch(){
   const q=$('tstQ').value.trim(); if(!q) return;
@@ -4026,7 +4051,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings":
             values = {k: v for k, v in payload.items() if k != "force"}
-            issues = settings_schema.validate(values, full=read_env())
+            issues = settings_schema.validate(values, full=env_with_secrets())
             errors = [i for i in issues if i["level"] == "error"]
             warnings = [i for i in issues if i["level"] == "warning"]
             # Ошибки не сохраняем никогда: с таким значением модуль просто
@@ -4108,7 +4133,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/settings/check":
             issues = settings_schema.validate(
-                {k: v for k, v in payload.items() if k != "force"}, full=read_env())
+                {k: v for k, v in payload.items() if k != "force"},
+                full=env_with_secrets())
             return self._json({"issues": issues,
                                "errors": sum(1 for i in issues if i["level"] == "error"),
                                "warnings": sum(1 for i in issues if i["level"] == "warning")})
@@ -4131,6 +4157,7 @@ class Handler(BaseHTTPRequestHandler):
                 "repair": "досчёт векторов",
                 "train_lsa": "обучение смысловой модели",
                 "reembed": "пересчёт векторов",
+                "embed_switch": "смена провайдера смыслового поиска",
                 "ocr": "распознавание сканов",
                 "ocr_retry": "повтор распознавания",
                 "backup": "резервная копия",

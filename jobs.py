@@ -55,6 +55,9 @@ RESOURCES: dict[str, tuple[str, ...]] = {
     "repair":        ("vectors",),
     "reembed":       ("vectors",),       # перезаписывает файл векторов целиком
     "train_lsa":     ("model",),
+    # Смена провайдера: качает веса, может обучать модель и целиком
+    # перезаписывает векторы — держит все три ресурса.
+    "embed_switch":  ("vectors", "model", "models"),
     "ocr":           ("index", "vectors"),
     "ocr_retry":     ("index", "vectors"),
     "media":         ("index", "vectors"),

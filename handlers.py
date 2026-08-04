@@ -86,7 +86,37 @@ def _reembed(payload: dict, progress) -> dict:
                           only_missing=bool(payload.get("only_missing")),
                           progress=progress)
     result = {"chunks": n, "provider": provider}
+    # Выбор провайдера в reembed раньше жил только в памяти процесса и
+    # после перезапуска молча возвращался к прежнему («вернулось на lsa»).
+    # Если пересчёт с явно выбранным провайдером прошёл — сохраняем выбор.
+    if n and payload.get("provider"):
+        import embeddings
+        info = embeddings.describe()
+        if info.get("provider") == payload["provider"] and not info.get("error"):
+            import webui
+            webui.write_env({"EMBEDDINGS_PROVIDER": payload["provider"]})
+            progress(f"Провайдер «{payload['provider']}» сохранён в настройках.")
     _regression_after(f"пересчёт векторов ({provider})", progress, result)
+    return result
+
+
+@jobs.handler("embed_switch")
+def _embed_switch(payload: dict, progress) -> dict:
+    """Смена провайдера смыслового поиска под ключ.
+
+    Установка пакетов, загрузка весов, обучение, проверка, сохранение
+    настроек — в embed_setup.switch(); затем полный пересчёт векторов,
+    без которого старые векторы несовместимы с новой моделью.
+    """
+    import embed_setup
+    import index as index_mod
+    result = embed_setup.switch(payload.get("provider") or "",
+                                model=payload.get("model"),
+                                progress=progress)
+    progress("Пересчитываю векторы под нового провайдера")
+    result["chunks"] = index_mod.reembed(progress=progress)
+    _regression_after(f"смена смыслового поиска ({result['provider']})",
+                      progress, result)
     return result
 
 
