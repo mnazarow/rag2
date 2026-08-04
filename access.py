@@ -127,6 +127,31 @@ def block(user_id: int, by: str = "админка", note: str = "") -> dict:
     return get(user_id)
 
 
+def set_trainer(user_id: int, on: bool, by: str = "админка") -> dict:
+    """Признак «дообучение»: право добавлять выверенные ответы из Telegram.
+
+    Отдельно от роли, потому что это ортогональные вещи: снабженец может
+    отлично знать насосы и учить бота, не получая доступа к дилерским
+    ценам; и наоборот, доступ ко всем разделам не делает человека
+    экспертом, чьи ответы стоит закреплять как эталонные.
+    """
+    ensure(user_id)
+    db.run("UPDATE users SET trainer=?, decided_at=?, decided_by=? WHERE user_id=?",
+           (int(on), _now(), by, user_id))
+    log.warning("дообучение %s: %s (решил %s)",
+                "включено" if on else "выключено", user_id, by)
+    return get(user_id)
+
+
+def can_train(user: dict) -> bool:
+    """Можно ли этому сотруднику добавлять выверенные ответы."""
+    if user.get("user_id") in config.TELEGRAM_ADMIN_IDS:
+        return True
+    if not is_allowed(user):
+        return False
+    return user.get("role") == "admin" or bool(user.get("trainer"))
+
+
 def set_role(user_id: int, role: str, by: str = "админка") -> dict:
     ensure(user_id)
     db.run("UPDATE users SET role=?, decided_at=?, decided_by=? WHERE user_id=?",
@@ -139,7 +164,9 @@ def listing(status: str | None = None) -> list[dict]:
     """Все, кто когда-либо обращался, с их активностью."""
     sql = """SELECT u.*,
                     (SELECT COUNT(*) FROM queries q WHERE q.user_id=u.user_id) asked,
-                    (SELECT MAX(created_at) FROM queries q WHERE q.user_id=u.user_id) last_q
+                    (SELECT MAX(created_at) FROM queries q WHERE q.user_id=u.user_id) last_q,
+                    (SELECT COUNT(*) FROM golden_qa g
+                     WHERE g.author_id=u.user_id AND g.active=1) taught
              FROM users u"""
     params: tuple = ()
     if status:

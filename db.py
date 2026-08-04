@@ -382,7 +382,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                         ("decided_by", "TEXT"),
                         ("note", "TEXT"),
                         ("last_seen", "TEXT"),
-                        ("questions", "INTEGER DEFAULT 0")):
+                        ("questions", "INTEGER DEFAULT 0"),
+                        # Признак «дообучение»: сотрудник может добавлять
+                        # выверенные ответы из Telegram, не будучи админом.
+                        ("trainer", "INTEGER DEFAULT 0")):
         if column not in have_u:
             _add_column(conn, "users", column, ddl)
     # Разовое согласование старых записей с новой колонкой. Раньше этот

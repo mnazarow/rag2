@@ -407,6 +407,66 @@ class TestLogMasking(unittest.TestCase):
         self.assertNotIn("sk-tajnyj-kljuch-12345678", record.getMessage())
 
 
+class TestTrainerFlag(Isolated):
+    """Признак «дообучение»: право закреплять ответы отдельно от роли."""
+
+    def test_trainer_can_train_admin_can_ordinary_cannot(self):
+        import access
+        access.ensure(1, "vasya", "Вася")
+        access.decide(1, True, role="sales")
+        self.assertFalse(access.can_train(access.get(1)))
+        access.set_trainer(1, True, by="тест")
+        self.assertTrue(access.can_train(access.get(1)))
+        access.set_trainer(1, False, by="тест")
+        self.assertFalse(access.can_train(access.get(1)))
+        # Роль admin учит и без признака.
+        access.ensure(2)
+        access.decide(2, True, role="admin")
+        self.assertTrue(access.can_train(access.get(2)))
+
+    def test_trainer_without_access_cannot_train(self):
+        """Признак без доступа ничего не даёт: заблокированный не учит."""
+        import access
+        access.ensure(3)
+        access.set_trainer(3, True)
+        access.block(3)
+        self.assertFalse(access.can_train(access.get(3)))
+
+    def test_bot_teach_command_for_trainer(self):
+        import access
+        import bot
+        self.config.ROLE_SECTIONS = {"sales": ["*"]}
+        access.ensure(5, "petya", "Петя")
+        access.decide(5, True, role="sales")
+        # Без признака — вежливый отказ с подсказкой, где включить.
+        out = bot.handle_message(5, 5, "petya", "Петя",
+                                 "/учить Напор Водомет 55/75? | 75 метров.")
+        self.assertIn("дообучение", out["text"])
+        access.set_trainer(5, True)
+        out = bot.handle_message(5, 5, "petya", "Петя",
+                                 "/учить Напор Водомет 55/75? | 75 метров.")
+        self.assertIn("Добавлено", out["text"])
+        row = self.db.q1("SELECT author_id FROM golden_qa ORDER BY id DESC")
+        self.assertEqual(row["author_id"], 5)
+
+    def test_listing_counts_taught_answers(self):
+        import access
+        import answer
+        access.ensure(7)
+        access.decide(7, True, role="sales")
+        answer.add_golden("Вопрос про насос?", "Ответ про насос.", author_id=7)
+        row = next(u for u in access.listing() if u["user_id"] == 7)
+        self.assertEqual(row["taught"], 1)
+
+    def test_ui_wired(self):
+        from tests.base import ROOT
+        src = (ROOT / "webui.py").read_text(encoding="utf-8")
+        for needle in ('data-t="telegram"', "loadTelegram", "setTrainer",
+                       '"/api/users/trainer"', 'id="tgPending"',
+                       'id="tgTrainers"', "setTelegram"):
+            self.assertIn(needle, src, needle)
+
+
 class TestAuditKeepsSecrets(Isolated):
     def test_key_value_never_reaches_the_audit_log(self):
         """

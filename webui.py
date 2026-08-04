@@ -735,6 +735,7 @@ svg{display:block;width:100%}
  <button data-t="queries">Запросы</button>
  <button data-t="analytics">Аналитика</button>
  <button data-t="users">Сотрудники</button>
+ <button data-t="telegram">Телеграм</button>
  <button data-t="safety">Безопасность</button>
  <button data-t="diag">Диагностика</button>
 </nav><div id="health"></div></header>
@@ -1444,6 +1445,36 @@ svg{display:block;width:100%}
     <th>Доступные разделы</th></tr></thead><tbody></tbody></table>
 </section>
 
+<!-- ═══════════════════════════════════ телеграм ═════════════════════════ -->
+<section id="telegram">
+  <h2>Телеграм</h2>
+  <p class="muted">Всё про бота в одном месте: настройки, заявки сотрудников
+    на доступ и право дообучения. Сотрудник пишет боту → отправляет
+    <code>/request</code> → заявка появляется ниже → вы подтверждаете её
+    одним нажатием, сразу выбрав роль.</p>
+  <div class="cards" id="tgCards"></div>
+
+  <h2>Заявки на доступ</h2>
+  <table id="tgPending"><thead><tr><th>Сотрудник</th><th style="width:120px">ID</th>
+    <th>Пояснение</th><th style="width:150px">Роль</th>
+    <th style="width:210px"></th></tr></thead><tbody></tbody></table>
+
+  <h2>Дообучение</h2>
+  <p class="muted">Сотрудник с признаком «дообучение» может закреплять
+    эталонные ответы прямо из Telegram командой
+    <code>/учить вопрос | ответ</code> — на похожий вопрос бот дальше
+    отвечает именно так. Признак не зависит от роли: снабженец может
+    отлично знать насосы и учить бота, не получая доступа к дилерским
+    ценам. Каждый добавленный ответ виден в разделе
+    «Контрольные вопросы» → «Выверенные ответы».</p>
+  <table id="tgTrainers"><thead><tr><th>Сотрудник</th><th style="width:110px">ID</th>
+    <th style="width:130px">Роль</th><th style="width:150px">Дообучение</th>
+    <th style="width:120px">Ответов добавил</th></tr></thead><tbody></tbody></table>
+
+  <h2>Настройки Telegram</h2>
+  <div id="setTelegram"></div>
+</section>
+
 <!-- ═══════════════════════════════════ безопасность ═════════════════════ -->
 <section id="safety">
   <h2>Что требует внимания прямо сейчас</h2>
@@ -1560,6 +1591,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.t === 'backup') loadBackup();
   if (b.dataset.t === 'analytics') loadAnalytics();
   if (b.dataset.t === 'users') loadUsers();
+  if (b.dataset.t === 'telegram') loadTelegram();
   if (b.dataset.t === 'safety') loadSafety();
   if (b.dataset.t === 'graph') $('graphFrame').src='/graph.html?t='+Date.now();
 });
@@ -2334,6 +2366,7 @@ async function loadSettings(){
      'LSA_MIN_DF','LSA_STALE_RATIO','ONNX_MODEL_PATH','ONNX_TOKENIZER_DIR',
      'ONNX_POOLING','ONNX_MAX_TOKENS'],'loadSearch');
   renderGroup('setOcr',['Распознавание сканов'],null,'loadOcr');
+  renderGroup('setTelegram',['Telegram'],null,'loadTelegram');
   renderGroup('setBackup',['Резервные копии'],null,'loadBackup');
   renderGroup('setQueue',['Очередь к модели'],null,'loadQueue');
 }
@@ -3136,6 +3169,56 @@ async function saveRole(id,field){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({user_id:id,role:$(field).value})});
   loadUsers();
+}
+
+/* ------------------------------------ телеграм ---------------------------- */
+async function loadTelegram(){
+  USERS=await (await fetch('/api/users')).json();
+  const s=USERS.summary;
+  const trainers=USERS.users.filter(u=>u.trainer).length;
+  $('tgCards').innerHTML=[
+    ['Ждут решения',s.counts.pending],['Есть доступ',s.counts.approved],
+    ['Дообучают бота',trainers],['Всего обращались',s.total],
+  ].map(([k,v])=>`<div class="card${k==='Ждут решения'&&v?' warn':''}">
+    <div class="v">${RU(v)}</div><div class="k">${k}</div></div>`).join('');
+
+  const pending=USERS.users.filter(u=>u.status==='pending');
+  document.querySelector('#tgPending tbody').innerHTML=pending.map(u=>
+    `<tr><td><b>${esc(u.full_name||'без имени')}</b>
+       ${u.user_name?`<div class="muted">@${esc(u.user_name)}</div>`:''}
+       <div class="muted" style="font-size:11px">обратился
+         ${(u.requested_at||'').replace('T',' ').slice(0,16)}</div></td>
+     <td><code>${u.user_id}</code></td>
+     <td class="muted">${esc(u.note||'—')}</td>
+     <td>${roleSelect(u,'tgrole_'+u.user_id)}</td>
+     <td><button class="act" onclick="tgDecide(${u.user_id},true)">Разрешить</button>
+         <button class="act sec" onclick="tgDecide(${u.user_id},false)">Отклонить</button></td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Заявок нет. Сотрудник оставляет заявку командой /request в боте.</td></tr>';
+
+  const known=USERS.users.filter(u=>u.status==='approved'||u.trainer);
+  document.querySelector('#tgTrainers tbody').innerHTML=known.map(u=>
+    `<tr><td>${esc(u.full_name||'без имени')}
+       ${u.user_name?`<span class="muted">@${esc(u.user_name)}</span>`:''}</td>
+     <td><code>${u.user_id}</code></td>
+     <td class="muted">${esc(u.role||'—')}</td>
+     <td><label><input type="checkbox" ${u.trainer?'checked':''}
+          onchange="setTrainer(${u.user_id},this.checked)">
+          ${u.trainer?'<span class="good">учит бота</span>':'выключено'}</label></td>
+     <td>${RU(u.taught||0)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Пока некому включать: нет сотрудников с доступом.</td></tr>';
+}
+async function tgDecide(id,approve){
+  const sel=$('tgrole_'+id);
+  await fetch('/api/users/decide',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({user_id:id,approve,role:sel?sel.value:null})});
+  loadTelegram();
+}
+async function setTrainer(id,on){
+  await fetch('/api/users/trainer',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({user_id:id,on})});
+  loadTelegram();
 }
 
 /* ------------------------------------ журналы ----------------------------- */
@@ -4416,6 +4499,15 @@ class Handler(BaseHTTPRequestHandler):
             user = access.set_role(user_id, str(payload.get("role")), by=self._who())
             audit("роль", f"{user.get('full_name') or user_id} → {user.get('role')}",
                   {"user_id": user_id})
+            return self._json(user)
+
+        if path == "/api/users/trainer":
+            import access
+            user_id = int(payload.get("user_id", 0))
+            on = bool(payload.get("on"))
+            user = access.set_trainer(user_id, on, by=self._who())
+            audit("дообучение", ("включено" if on else "выключено")
+                  + f": {user.get('full_name') or user_id}", {"user_id": user_id})
             return self._json(user)
 
         if path.startswith("/api/models/"):

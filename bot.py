@@ -55,7 +55,8 @@ HELP = (
     "/stats — что сейчас в индексе\n"
     "/gaps — вопросы, на которые бот не смог ответить\n"
     "/request — запросить доступ к базе знаний\n"
-    "/expert вопрос | ответ — добавить выверенный ответ (для экспертов)\n"
+    "/учить вопрос | ответ — добавить выверенный ответ (для экспертов и "
+    "сотрудников с признаком «дообучение»; /expert работает так же)\n"
     "/whoami — ваш id и роль"
 )
 
@@ -226,7 +227,7 @@ def handle_message(user_id: int, chat_id: int, user_name: str | None,
         return {"text": stats_text()}
     if text.startswith("/gaps"):
         return {"text": gaps_text()}
-    if text.startswith("/expert"):
+    if text.startswith(("/expert", "/учить", "/teach")):
         return {"text": handle_expert(user, text)}
 
     logging_setup.new_request(user_id, "telegram")
@@ -307,12 +308,23 @@ def handle_voice(user_id: int, chat_id: int, user_name: str | None,
 
 
 def handle_expert(user: dict, text: str) -> str:
-    """/expert вопрос | ответ — добавление выверенного ответа в golden-базу."""
-    if user["role"] != "admin" and user["user_id"] not in config.TELEGRAM_ADMIN_IDS:
-        return "Добавлять выверенные ответы могут только эксперты (роль admin)."
-    payload = text[len("/expert"):].strip()
+    """/expert (или /учить) вопрос | ответ — выверенный ответ в golden-базу.
+
+    Право дают роль admin или признак «дообучение» — его администратор
+    включает сотруднику в разделе «Телеграм» веб-интерфейса.
+    """
+    if not access.can_train(user):
+        return ("Добавлять выверенные ответы могут эксперты и сотрудники "
+                "с признаком «дообучение». Попросите администратора включить "
+                "его вам в разделе «Телеграм» веб-интерфейса.")
+    for prefix in ("/expert", "/учить", "/teach"):
+        if text.startswith(prefix):
+            payload = text[len(prefix):].strip()
+            break
     if "|" not in payload:
-        return "Формат: <code>/expert вопрос | ответ</code>"
+        return ("Формат: <code>/учить вопрос | ответ</code>\n"
+                "Пример: <code>/учить Какой напор у Водомет 55/75? | "
+                "Напор 75 м, подача 55 л/мин.</code>")
     question, expert_answer = (p.strip() for p in payload.split("|", 1))
     if len(question) < 5 or len(expert_answer) < 5:
         return "Слишком короткий вопрос или ответ."
