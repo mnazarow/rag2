@@ -66,6 +66,16 @@ fi
 # Код берём из отдельной папки, только если она действительно другая.
 [ -n "$SOURCE" ] && [ "$(cd "$SOURCE" && pwd)" = "$TARGET" ] && SOURCE=""
 
+# Скрипт запущен из папки с кодом (клона), а установка нашлась в другом
+# месте — значит, код нужно брать отсюда, это и есть смысл запуска.
+# Раньше SOURCE в этом случае оставался пустым, скрипт шёл обновляться
+# через git прямо в установке, а «git stash --include-untracked» прятал
+# в тайник неотслеживаемые файлы — вместе с .env. Со стороны это
+# выглядело как «все настройки сбрасываются при обновлении».
+if [ -z "$SOURCE" ] && [ "$TARGET" != "$HERE" ] && [ -f "$HERE/webui.py" ]; then
+  SOURCE="$HERE"
+fi
+
 BACKUP_DIR="$TARGET/backups"
 GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; BLUE='\033[36m'; NC='\033[0m'
 say(){ printf "${BLUE}==>${NC} %s\n" "$*"; }
@@ -173,6 +183,13 @@ done
 
 say "Обновляю код"
 printf "  установка: %s\n" "$TARGET"
+# Настройки не имеют права меняться от обновления кода: их меняет только
+# сам ассистент. Снимок до копирования и безусловное восстановление после
+# защищают .env и файл ключей на любом пути обновления — rsync, tar, git.
+ENV_TMP="$(mktemp -d)"
+for f in .env secrets.env; do
+  [ -f "$TARGET/$f" ] && cp "$TARGET/$f" "$ENV_TMP/$f"
+done
 if [ -n "$SOURCE" ]; then
   # Код лежит отдельно — например, в клоне репозитория. Копируем только
   # его: данные, настройки и ключи установки остаются на месте. Именно
@@ -190,12 +207,41 @@ if [ -n "$SOURCE" ]; then
       | (cd "$TARGET" && tar xf -) && ok "код обновлён из $SOURCE"
   fi
 elif [ -d "$TARGET/.git" ]; then
-  git -C "$TARGET" stash push --include-untracked -m "update-$STAMP" >/dev/null 2>&1 || true
+  # Прячем только ПРАВКИ отслеживаемых файлов. Никакого --include-untracked:
+  # .env, данные и журналы в git не отслеживаются, и тот ключ утаскивал их
+  # в тайник — после обновления настройки «сбрасывались» на умолчания.
+  git -C "$TARGET" stash push -m "update-$STAMP" >/dev/null 2>&1 || true
   git -C "$TARGET" pull --ff-only && ok "код обновлён"
 else
   warn "Установка не под git и источник не указан — обновлять нечем."
   warn "Либо распакуйте новый архив поверх, либо укажите папку с кодом:"
   warn "    $0 --target $TARGET --from /путь/к/репозиторию"
+fi
+
+# Возвращаем настройки из снимка, если обновление кода их изменило или
+# стёрло — независимо от того, каким путём шло обновление.
+for f in .env secrets.env; do
+  if [ -f "$ENV_TMP/$f" ] && ! cmp -s "$ENV_TMP/$f" "$TARGET/$f" 2>/dev/null; then
+    cp "$ENV_TMP/$f" "$TARGET/$f"
+    ok "настройки ($f) восстановлены — обновление кода их не меняет"
+  fi
+done
+rm -rf "$ENV_TMP"
+
+# Настройки, спрятанные прошлыми обновлениями в git stash (старая ошибка
+# с --include-untracked), возвращаем на место. Неотслеживаемые файлы
+# stash хранит в третьем родителе записи.
+if [ ! -f "$TARGET/.env" ] && [ -d "$TARGET/.git" ]; then
+  for st in $(git -C "$TARGET" stash list --format='%gd' 2>/dev/null); do
+    if git -C "$TARGET" show "$st^3:.env" > "$TARGET/.env" 2>/dev/null \
+       || git -C "$TARGET" show "$st:.env" > "$TARGET/.env" 2>/dev/null; then
+      if [ -s "$TARGET/.env" ]; then
+        ok "настройки нашлись в git stash ($st) и восстановлены"
+        break
+      fi
+    fi
+    rm -f "$TARGET/.env"
+  done
 fi
 
 # Скрипт обновления только что мог обновить сам себя. Всё, что дальше, —

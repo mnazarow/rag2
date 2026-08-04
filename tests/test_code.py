@@ -418,6 +418,27 @@ class TestQuickStart(unittest.TestCase):
         self.assertIn('STAGE2_ARGS+=(--no-backup)', sh)
         self.assertIn("NoBackup", ps)
 
+    def test_update_never_touches_settings(self):
+        """
+        Регрессия «все настройки сбрасываются при обновлении».
+
+        Три защиты: git stash без --include-untracked (тот ключ утаскивал
+        неотслеживаемый .env в тайник); снимок .env и secrets.env до
+        копирования кода с безусловным восстановлением после; возврат
+        настроек, спрятанных прошлыми обновлениями в stash. Плюс запуск
+        из клона подставляет клон источником кода, а не гоняет git
+        в установке.
+        """
+        sh = (ROOT / "install" / "update.sh").read_text(encoding="utf-8")
+        # Ключ может упоминаться в комментариях (как история ошибки),
+        # но не в самой команде.
+        self.assertNotIn("stash push --include-untracked", sh)
+        self.assertIn('stash push -m "update-$STAMP"', sh)
+        self.assertIn("ENV_TMP", sh)
+        self.assertIn("secrets.env", sh)
+        self.assertIn('^3:.env', sh)                 # untracked в stash
+        self.assertIn('SOURCE="$HERE"', sh)          # запуск из клона
+
     def test_ollama_installed_by_all_installers(self):
         """
         ollama ставят и установка, и обновление, на всех трёх системах:
