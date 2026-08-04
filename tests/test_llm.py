@@ -20,7 +20,7 @@ from tests.base import Isolated  # noqa: F401 — путь к проекту
 class FakeModelServer(BaseHTTPRequestHandler):
     """OpenAI-совместимый сервер: отвечает, ломается или молчит по команде."""
 
-    mode = "ok"                 # ok | error | slow
+    mode = "ok"                 # ok | error | slow | notfound
     seen: list[dict] = []
 
     def log_message(self, *args):
@@ -34,6 +34,16 @@ class FakeModelServer(BaseHTTPRequestHandler):
             self.send_response(500)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if FakeModelServer.mode == "notfound":
+            # Так отвечает ollama на незнакомое имя модели.
+            data = json.dumps({"error": {"message":
+                f"model '{body.get('model')}' not found"}}).encode()
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
         if FakeModelServer.mode == "slow":
             time.sleep(2.0)
@@ -152,6 +162,32 @@ class TestLocalAndCloud(Isolated):
             self.assertIn("причина такая-то", str(ctx.exception))
         finally:
             llm_mod.PROVIDERS.pop("broken", None)
+
+    def test_404_names_model_and_next_step(self):
+        """Регрессия: голый «404 Not Found» от сервера ничего не объяснял.
+        Теперь ошибка называет модель, адрес и что нажать."""
+        FakeModelServer.mode = "notfound"
+        engine = self.llm.LocalLLM()
+        with self.assertRaises(self.llm.LLMError) as ctx:
+            engine.complete("с", "п")
+        text = str(ctx.exception)
+        self.assertIn("не знает модель", text)
+        self.assertIn("t-pro-2.0", text)
+        self.assertIn("Запустить и использовать", text)
+        self.assertIn("not found", text)      # ответ сервера тоже виден
+
+    def test_model_name_prefers_served_name(self):
+        """Без LOCAL_LLM_MODEL имя берётся то, под которым модель знает
+        сервер (served_name), а не наш идентификатор каталога — иначе 404."""
+        from unittest import mock
+
+        import models
+        self.config.LOCAL_LLM_MODEL = ""
+        state = {"running": True, "base_url": self.url,
+                 "model": "qwen3.6-27b", "served_name": "qwen3:32b"}
+        with mock.patch.object(models, "status", return_value=state):
+            engine = self.llm.LocalLLM()
+        self.assertEqual(engine.model, "qwen3:32b")
 
     def test_probe_reports_latency(self):
         self.config.LLM_PROVIDER = "local"

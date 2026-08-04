@@ -215,13 +215,18 @@ class LocalLLM(OpenAICompatibleLLM):
             raise LLMError(
                 "локальная модель не запущена. Раздел «Модели» → выбрать модель "
                 "и нажать «Запустить», либо указать адрес в LOCAL_LLM_BASE_URL.")
+        # Имя модели — то, под которым её знает САМ сервер (served_name,
+        # например «qwen3:32b» у ollama), а не наш внутренний идентификатор
+        # из каталога: сервер на незнакомое имя отвечает «404 Not Found».
         self.model = (model or config.LOCAL_LLM_MODEL
-                      or state.get("model") or config.LLM_MODEL or "local")
+                      or state.get("served_name") or state.get("model")
+                      or config.LLM_MODEL or "local")
         self.api_key = config.LOCAL_LLM_API_KEY
         self.client = httpx.Client(timeout=config.LOCAL_LLM_TIMEOUT)
         self.server = state
 
     def complete(self, system: str, user: str) -> LLMResponse:
+        import httpx
         r = self.client.post(
             f"{self.base_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
@@ -230,7 +235,19 @@ class LocalLLM(OpenAICompatibleLLM):
                                {"role": "user", "content": user}],
                   "temperature": config.LLM_TEMPERATURE,
                   "max_tokens": config.LLM_MAX_TOKENS})
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = (r.text or "")[:300]
+            if r.status_code == 404:
+                raise LLMError(
+                    f"сервер {self.base_url} не знает модель «{self.model}». "
+                    "Нажмите «Запустить и использовать» в разделе «Модели» "
+                    "или проверьте LOCAL_LLM_MODEL в настройках. "
+                    f"Ответ сервера: {body}") from exc
+            raise LLMError(
+                f"сервер {self.base_url} ответил {r.status_code}: {body}"
+            ) from exc
         data = r.json()
         usage = data.get("usage", {})
         return LLMResponse(data["choices"][0]["message"]["content"],
