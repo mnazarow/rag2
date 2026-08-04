@@ -493,6 +493,87 @@ class TestServeErrors(Isolated):
         self.assertIn("освободится сама", last["detail"])
 
 
+class TestLocalVision(Isolated):
+    """Описание изображений по умолчанию — локальной моделью, сама находится."""
+
+    def test_default_provider_is_local(self):
+        import settings_schema
+        spec = next(s for s in settings_schema.SETTINGS
+                    if s["key"] == "VISION_PROVIDER")
+        self.assertEqual(spec["default"], "local")
+
+    def test_prefers_running_vision_server(self):
+        from unittest import mock
+
+        import media
+        import models
+        st = {"running": True, "model": "qwen3-vl-8b",
+              "base_url": "http://127.0.0.1:8011/v1",
+              "served_name": "qwen3-vl:8b"}
+        with mock.patch.object(models, "status", return_value=st):
+            base, model = media.local_vision_endpoint()
+        self.assertEqual(base, "http://127.0.0.1:8011/v1")
+        self.assertEqual(model, "qwen3-vl:8b")
+
+    def test_falls_back_to_ollama_vision_model(self):
+        from unittest import mock
+
+        import media
+        import models
+        with mock.patch.object(models, "status",
+                               return_value={"running": False}), \
+             mock.patch.object(models, "_ollama_tags",
+                               return_value=["qwen3.6:27b", "qwen3-vl:8b"]):
+            base, model = media.local_vision_endpoint()
+        self.assertIn("11434", base)
+        self.assertEqual(model, "qwen3-vl:8b")
+
+    def test_no_model_explains_what_to_download(self):
+        from unittest import mock
+
+        import media
+        import models
+        with mock.patch.object(models, "status",
+                               return_value={"running": False}), \
+             mock.patch.object(models, "_ollama_tags", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "Скачать"):
+                media.local_vision_endpoint()
+
+    def test_serve_vision_does_not_touch_openai_settings(self):
+        """Регрессия: запуск зрительной модели прописывал OPENAI_BASE_URL
+        и молча ломал настройки облачного провайдера."""
+        import contextlib
+        from unittest import mock
+
+        import models
+        import webui
+        with contextlib.ExitStack() as st:
+            for args in (("system", "Darwin"), ("machine", "arm64")):
+                import platform
+                st.enter_context(mock.patch.object(platform, args[0],
+                                                   return_value=args[1]))
+            st.enter_context(mock.patch.object(
+                models.shutil, "which", lambda x: "/x/ollama"))
+            st.enter_context(mock.patch.object(models, "_ollama_alive",
+                                               return_value=True))
+            st.enter_context(mock.patch.object(models, "_ollama_tags",
+                                               return_value=["qwen3-vl:8b"]))
+            st.enter_context(mock.patch.object(models, "_server_knows",
+                                               return_value=None))
+            write = st.enter_context(mock.patch.object(webui, "write_env"))
+            models.serve("qwen3-vl-8b", apply_config=True)
+        updates = write.call_args[0][0]
+        self.assertEqual(updates["VISION_PROVIDER"], "local")
+        self.assertNotIn("OPENAI_BASE_URL", updates)
+        self.assertNotIn("OPENAI_API_KEY", updates)
+
+    def test_vision_models_runnable_on_mac(self):
+        import models
+        for mid in ("qwen3-vl-8b", "qwen3-vl-32b"):
+            spec = models.BY_ID[mid]
+            self.assertTrue(spec.ollama_tag, mid)
+
+
 class TestModelProgressAndLog(Isolated):
     """Прогресс-бар и журнал действий в разделе «Модели»."""
 

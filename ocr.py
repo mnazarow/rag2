@@ -263,8 +263,16 @@ class VlmOCR:
     def __init__(self) -> None:
         import httpx
         base = config.OCR_BASE_URL or config.OPENAI_BASE_URL
+        self._model = ""
         if not base:
-            raise OcrError("не задан OCR_BASE_URL (или OPENAI_BASE_URL)")
+            # Адрес не задан — ищем локальную модель зрения так же, как
+            # это делает описание изображений: сканы тогда тоже никуда не
+            # уходят с сервера и не требуют ручной настройки адресов.
+            try:
+                import media
+                base, self._model = media.local_vision_endpoint()
+            except RuntimeError as exc:
+                raise OcrError(str(exc)) from exc
         self.url = base.rstrip("/") + "/chat/completions"
         key = config.OCR_API_KEY or config.OPENAI_API_KEY
         self.client = httpx.Client(timeout=config.OCR_TIMEOUT,
@@ -275,7 +283,7 @@ class VlmOCR:
         import llm_queue
         data = base64.b64encode(image.read_bytes()).decode()
         payload = {
-            "model": config.OCR_MODEL,
+            "model": config.OCR_MODEL or self._model,
             "temperature": 0,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": PROMPT},

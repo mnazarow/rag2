@@ -237,13 +237,13 @@ CATALOG: list[ModelSpec] = [
         params="8 млрд", arch="Qwen3-VL", kind="vision", vram_gb=10,
         quant="AWQ int4", context=32768, license="Apache 2.0",
         russian="единственная не путающая кириллицу с латиницей", engine="vllm",
-        recommended=True,
+        ollama_tag="qwen3-vl:8b", recommended=True,
         notes="Описание фотографий продукции и чтение надписей с шильдиков."),
     ModelSpec(
         id="qwen3-vl-32b", title="Qwen3-VL 32B", repo="Qwen/Qwen3-VL-32B-Instruct",
         params="32 млрд", arch="Qwen3-VL", kind="vision", vram_gb=22,
         quant="AWQ int4", context=32768, license="Apache 2.0", russian="отличное",
-        engine="vllm",
+        engine="vllm", ollama_tag="qwen3-vl:32b",
         notes="Заметно точнее на сложных сканах и чертежах. Имеет смысл запускать "
               "разово для обработки архива, а не держать постоянно."),
 
@@ -894,10 +894,12 @@ def _serve(model_id: str, engine: str | None = None, port: int | None = None,
             updates["LLM_PROVIDER"] = "local"
             updates["LOCAL_LLM_MODEL"] = served
         elif spec.kind == "vision":
-            updates["VISION_PROVIDER"] = "openai"
+            # «local» сам находит работающий сервер зрения. Раньше здесь
+            # прописывался openai + OPENAI_BASE_URL — то есть запуск
+            # зрительной модели молча ломал настройки облачного
+            # провайдера, которыми пользуются остальные модули.
+            updates["VISION_PROVIDER"] = "local"
             updates["VISION_MODEL"] = served
-            updates["OPENAI_BASE_URL"] = base_url
-            updates["OPENAI_API_KEY"] = "local"
         elif spec.kind == "embedding":
             updates["EMBEDDINGS_PROVIDER"] = "openai"
             updates["EMBEDDINGS_MODEL"] = served

@@ -257,6 +257,35 @@ VISION_PROMPT = (
 )
 
 
+def local_vision_endpoint() -> tuple[str, str]:
+    """Адрес и имя локальной модели зрения — находятся сами.
+
+    Порядок поиска: сервер, запущенный из раздела «Модели» (если на нём
+    зрительная модель), затем сервер ollama со зрительной моделью из
+    каталога. Прописывать адреса руками не нужно: описание изображений
+    по умолчанию работает локально, как только модель скачана.
+    """
+    import models as models_mod
+    st = models_mod.status()
+    if st.get("running"):
+        spec = models_mod.BY_ID.get(st.get("model") or "")
+        if spec is not None and spec.kind == "vision":
+            return st["base_url"], st.get("served_name") or spec.id
+    tags = models_mod._ollama_tags() or []
+    # Сначала модель, явно указанная в настройках, затем каталог.
+    wanted = [config.VISION_MODEL] if config.VISION_MODEL else []
+    wanted += [m.ollama_tag for m in models_mod.CATALOG
+               if m.kind == "vision" and m.ollama_tag]
+    for tag in wanted:
+        if any(models_mod._tag_eq(tag, t) for t in tags):
+            return "http://127.0.0.1:11434/v1", tag
+    raise RuntimeError(
+        "локальная модель зрения не найдена: сервер из раздела «Модели» не "
+        "запущен со зрительной моделью, а в ollama её нет. Раздел «Модели» → "
+        "карточка «Qwen3-VL 8B» → «Скачать» (или `ollama pull qwen3-vl:8b`) — "
+        "и описание изображений заработает само.")
+
+
 def describe_image(path: Path) -> str:
     """Описание изображения через VLM. Возвращает пустую строку, если выключено."""
     if config.VISION_PROVIDER == "none":
@@ -270,11 +299,21 @@ def describe_image(path: Path) -> str:
     b64 = base64.b64encode(data).decode()
     mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
 
-    if config.VISION_PROVIDER == "openai":
-        client = httpx.Client(timeout=180, proxy=config.LLM_PROXY or None)
-        r = client.post(f"{config.OPENAI_BASE_URL}/chat/completions",
-                        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-                        json={"model": config.VISION_MODEL, "messages": [{
+    if config.VISION_PROVIDER in ("openai", "local"):
+        # «local» — умолчание: описания делает своя модель, изображения
+        # не покидают сервер и не стоят денег за токены.
+        if config.VISION_PROVIDER == "local":
+            base_url, model = local_vision_endpoint()
+            headers: dict = {}
+            proxy = None
+        else:
+            base_url, model = config.OPENAI_BASE_URL, config.VISION_MODEL
+            headers = {"Authorization": f"Bearer {config.OPENAI_API_KEY}"}
+            proxy = config.LLM_PROXY or None
+        client = httpx.Client(timeout=180, proxy=proxy)
+        r = client.post(f"{base_url.rstrip('/')}/chat/completions",
+                        headers=headers,
+                        json={"model": model, "messages": [{
                             "role": "user", "content": [
                                 {"type": "text", "text": VISION_PROMPT},
                                 {"type": "image_url",
@@ -288,6 +327,16 @@ def describe_image(path: Path) -> str:
 
 def cmd_describe(limit: int | None, force: bool) -> None:
     db.init()
+    # Готовность провайдера проверяем один раз до цикла: иначе на архиве
+    # в тысячи картинок одна и та же ошибка «модель не найдена»
+    # напечаталась бы тысячи раз.
+    if config.VISION_PROVIDER == "local":
+        try:
+            base_url, model = local_vision_endpoint()
+            print(f"Описывает локальная модель {model} ({base_url})")
+        except RuntimeError as exc:
+            print(f"Описание изображений пропущено: {exc}")
+            return
     where = "" if force else "AND (enriched IS NULL OR enriched NOT LIKE '%vision%')"
     rows = db.q(f"""SELECT id, abs_path, file_name FROM documents
                     WHERE asset_kind='image' AND status='ok' {where}""")

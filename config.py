@@ -199,7 +199,11 @@ ASR_SEGMENT_SECONDS = _env_int("ASR_SEGMENT_SECONDS", 60)   # длина смы�
 ASR_DEVICE = _env("ASR_DEVICE", "auto")
 
 # Описание изображений и превью чертежей: none | openai | gigachat | yandex | local
-VISION_PROVIDER = _env("VISION_PROVIDER", "none")
+# «local» по умолчанию: как только скачана зрительная модель из каталога
+# (или в ollama есть qwen3-vl), описания начинают делаться сами — локально,
+# бесплатно и без отправки изображений наружу. Пока модели нет, описание
+# честно пропускается с подсказкой, что скачать.
+VISION_PROVIDER = _env("VISION_PROVIDER", "local")
 VISION_MODEL = _env("VISION_MODEL", "qwen/qwen3-vl-32b-instruct")
 VISION_MAX_SIDE = _env_int("VISION_MAX_SIDE", 1280)
 
