@@ -217,6 +217,41 @@ class TestJobQueue(Isolated):
         self.assertEqual(done["status"], "error")
         self.assertIn("так и было задумано", done["error"])
 
+    def test_wait_queues_behind_conflicting_job(self):
+        """Регрессия «провайдер сам возвращается на lsa»: во время
+        многочасовой переиндексации смену провайдера раньше отклоняли
+        всегда — теперь она встаёт в очередь и ждёт своей очереди."""
+        self.jobs.enqueue("reindex", "переиндексация")
+        job = self.jobs.enqueue("embed_switch", "смена провайдера",
+                                {"provider": "local"}, wait=True)
+        self.assertEqual(job["status"], "queued")
+        # Повторная постановка такой же задачи не нужна и с wait.
+        with self.assertRaisesRegex(self.jobs.Busy, "уже есть"):
+            self.jobs.enqueue("embed_switch", "смена провайдера",
+                              {"provider": "local"}, wait=True)
+        # Без wait конфликтующие задачи отклоняются как раньше.
+        with self.assertRaises(self.jobs.Busy):
+            self.jobs.enqueue("reembed", "пересчёт")
+
+    def test_claim_skips_job_whose_resource_is_running(self):
+        """Ждущая задача не должна начаться, пока идёт конфликтующая."""
+        @self.jobs.handler("test_hold")
+        def _hold(payload, progress):
+            return {}
+        self.jobs.RESOURCES["test_hold"] = ("vectors",)
+        held = self.jobs.enqueue("test_hold", "долгая работа с векторами")
+        claimed = self.jobs._claim()          # долгая задача теперь running
+        self.assertEqual(claimed["id"], held["id"])
+        waiting = self.jobs.enqueue("embed_switch", "смена провайдера",
+                                    {"provider": "local"}, wait=True)
+        # Пока «векторы» заняты — ждущую брать нельзя.
+        self.assertIsNone(self.jobs._claim())
+        # Долгая закончилась — ждущая берётся следующей.
+        self.jobs._run_one(claimed)
+        nxt = self.jobs._claim()
+        self.assertIsNotNone(nxt)
+        self.assertEqual(nxt["id"], waiting["id"])
+
     def test_stale_job_frees_resource(self):
         """Убитый процесс не должен блокировать кнопку навсегда."""
         self.jobs.enqueue("reindex", "переиндексация")

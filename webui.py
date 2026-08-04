@@ -4079,9 +4079,15 @@ class Handler(BaseHTTPRequestHandler):
                                 "hint": "Эти настройки задают, как считаются "
                                         "векторы. Смена на ходу оборвёт задачу "
                                         "и оставит индекс, собранный по двум "
-                                        "разным моделям. Дождитесь окончания "
-                                        "или снимите задачу в разделе "
-                                        "«Конвейер»: " + ", ".join(risky)}]}, 200)
+                                        "разным моделям. Провайдера смыслового "
+                                        "поиска можно сменить и не дожидаясь: "
+                                        "кнопка «Переключить провайдера» в "
+                                        "разделе «Поиск» встанет в очередь и "
+                                        "выполнится сразу после текущей "
+                                        "задачи. Остальное — дождитесь "
+                                        "окончания или снимите задачу в "
+                                        "разделе «Конвейер»: "
+                                        + ", ".join(risky)}]}, 200)
             write_env(values)
             # В журнал пишем, что менялось, но не значения ключей. Иначе
             # весь смысл выноса ключей в защищённый файл пропадает:
@@ -4179,15 +4185,25 @@ class Handler(BaseHTTPRequestHandler):
             import jobs
             jobs.start_worker()
             payload_clean = {k: v for k, v in payload.items() if k != "kind"}
+            # Смена провайдера поиска умеет ждать: во время многочасовой
+            # переиндексации отказ «дождитесь окончания» означал бы, что
+            # провайдера не сменить практически никогда.
+            waits = kind == "embed_switch"
             try:
-                job = jobs.enqueue(kind, titles[kind], payload_clean)
+                job = jobs.enqueue(kind, titles[kind], payload_clean, wait=waits)
             except jobs.Busy as exc:
                 return self._json({"message": str(exc)}, 409)
             except Exception as exc:  # noqa: BLE001
                 return self._json({"message": safe_error(exc, "постановка задачи")}, 500)
             audit("задача", titles[kind], payload_clean)
+            note = ""
+            if waits:
+                busy = busy_with_indexing()
+                if busy:
+                    note = (f" Сейчас выполняется «{busy}» — переключение "
+                            f"начнётся сразу после неё, ничего делать не нужно.")
             return self._json({"message": f"Задача поставлена (№{job['id']}). "
-                                          f"Ход виден в разделе «Конвейер»."})
+                                          f"Ход виден в разделе «Конвейер».{note}"})
 
         if path == "/api/job/cancel":
             import jobs

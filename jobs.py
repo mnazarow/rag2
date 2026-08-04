@@ -128,12 +128,19 @@ def ensure_tables() -> None:
 # ------------------------------------------------------------ постановка ---
 def enqueue(kind: str, title: str = "", payload: dict | None = None,
             priority: int = 5, max_attempts: int = 1,
-            created_by: str = "админка") -> dict:
+            created_by: str = "админка", wait: bool = False) -> dict:
     """
     Ставит задачу в очередь. Если ресурс уже занят — отказывает.
 
     Отказ здесь лучше очереди: человек, нажавший кнопку второй раз, должен
     узнать, что работа уже идёт, а не получить вторую такую же через час.
+
+    wait=True меняет это для задач, которые пользователь ХОЧЕТ выполнить
+    после текущей работы: смена провайдера поиска во время многочасовой
+    переиндексации иначе была невозможна вовсе — отказ «дождитесь
+    окончания» приходил и через час, и через пять, и выбор «сам
+    возвращался» к прежнему. Повторная постановка ТАКОЙ ЖЕ задачи
+    отклоняется в любом случае: вторая копия не нужна никогда.
     """
     ensure_tables()
     needed = set(RESOURCES.get(kind, (kind,)))
@@ -142,9 +149,14 @@ def enqueue(kind: str, title: str = "", payload: dict | None = None,
     # это понятнее любого условия в SQL и не зависит от формата хранения.
     for row in db.q("SELECT id, kind, title, resource FROM jobs "
                     "WHERE status IN ('queued','running')"):
+        if row["kind"] == kind:
+            raise Busy(
+                f"такая задача уже есть: {row['title'] or row['kind']} "
+                f"(№{row['id']}). Второй раз ставить не нужно — ход виден "
+                f"в разделе «Конвейер».")
         busy_res = set((row["resource"] or "").split(","))
         clash = needed & busy_res
-        if clash:
+        if clash and not wait:
             raise Busy(
                 f"уже выполняется: {row['title'] or row['kind']} (задача №{row['id']}). "
                 f"Обе задачи меняют одно и то же ({', '.join(sorted(clash))}), "
@@ -268,9 +280,26 @@ def _wake() -> None:
 
 
 def _claim() -> dict | None:
-    """Берёт следующую задачу, не позволяя двум обработчикам взять одну."""
-    row = db.q1("""SELECT id, kind, resource FROM jobs WHERE status='queued'
-                   ORDER BY priority, id LIMIT 1""")
+    """Берёт следующую задачу, не позволяя двум обработчикам взять одну.
+
+    Задачи, чьи ресурсы заняты выполняющейся сейчас работой,
+    пропускаются: с появлением wait=True в очереди может стоять смена
+    провайдера, ждущая конца переиндексации, — второй обработчик
+    (например, запущенный из командной строки) не должен взять её
+    раньше времени.
+    """
+    running = db.q("SELECT resource FROM jobs WHERE status='running'")
+    busy: set[str] = set()
+    for r in running:
+        busy |= set(x for x in (r["resource"] or "").split(",") if x)
+    row = None
+    for cand in db.q("""SELECT id, kind, resource FROM jobs
+                        WHERE status='queued' ORDER BY priority, id"""):
+        need = set(x for x in (cand["resource"] or "").split(",") if x)
+        if need & busy:
+            continue
+        row = cand
+        break
     if row is None:
         return None
     # Условие в UPDATE — та самая защита от гонки: если другой обработчик
